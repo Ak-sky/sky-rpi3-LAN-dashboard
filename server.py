@@ -4,9 +4,12 @@ thread, cached results served as JSON + a live-refreshing HTML page."""
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -16,6 +19,12 @@ SCAN_INTERVAL = 90  # seconds; a full /24 sweep takes ~20-25s on a Pi 3
 DB_PATH = os.path.expanduser("~/lan-dashboard-data/devices.json")
 
 WIFI_IFACE = "wlan0"
+INTERNET_CHECK_HOST = "8.8.8.8"
+INTERNET_CHECK_PORT = 53
+INTERNET_CHECK_INTERVAL = 20  # seconds
+ALARM_WAV = os.path.expanduser("~/police_s.wav")
+
+PUBLIC_IP_CACHE_TTL = 1800  # public IP rarely changes; don't hit the external service often
 
 # nmap's bundled OUI DB (esp. on older versions) misses a lot of consumer
 # gear -- this is just a tiny supplement for prefixes we know matter here,
@@ -30,6 +39,10 @@ VENDOR_HINTS = {
 _lock = threading.Lock()
 _devices_db = {}
 _last_scan = {"at": None, "at_epoch": None, "duration_s": None, "hosts_up": None, "error": None}
+
+_internet_state = {"up": None, "latency_ms": None, "last_checked": None}
+_internet_events = []
+_public_ip_cache = {"ip": None, "ts": 0}
 
 
 def get_self_identity():
@@ -120,6 +133,145 @@ def get_self_throttled():
     }
 
 
+def get_self_uptime():
+    try:
+        with open("/proc/uptime") as f:
+            seconds = int(float(f.read().split()[0]))
+        days, rem = divmod(seconds, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
+        parts = ([f"{days}d"] if days else []) + [f"{hours}h", f"{minutes}m"]
+        return " ".join(parts)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_self_disk():
+    try:
+        total, used, free = shutil.disk_usage("/")
+        return {
+            "total_gb": round(total / 1024**3, 1),
+            "used_gb": round(used / 1024**3, 1),
+            "percent_used": round(100 * used / total, 1),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_self_memory():
+    try:
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, val = line.split(":", 1)
+                info[key] = int(val.strip().split()[0])
+        total_kb = info["MemTotal"]
+        avail_kb = info.get("MemAvailable", info["MemFree"])
+        used_kb = total_kb - avail_kb
+        return {
+            "total_mb": round(total_kb / 1024),
+            "used_mb": round(used_kb / 1024),
+            "percent_used": round(100 * used_kb / total_kb, 1),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_self_cpu_percent():
+    def read_idle_total():
+        with open("/proc/stat") as f:
+            fields = [int(x) for x in f.readline().split()[1:8]]
+        return fields[3], sum(fields)
+
+    try:
+        idle1, total1 = read_idle_total()
+        time.sleep(0.2)
+        idle2, total2 = read_idle_total()
+        total_delta = total2 - total1
+        if total_delta <= 0:
+            return None
+        return round(100 * (1 - (idle2 - idle1) / total_delta), 1)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+_updates_cache = {"count": None, "ts": 0}
+UPDATES_CACHE_TTL = 1800
+
+
+def get_self_updates_available():
+    now = time.time()
+    if now - _updates_cache["ts"] > UPDATES_CACHE_TTL:
+        try:
+            out = subprocess.run(
+                ["apt", "list", "--upgradable"],
+                capture_output=True, text=True, timeout=15,
+            ).stdout
+            lines = [l for l in out.strip().splitlines() if not l.startswith("Listing")]
+            _updates_cache["count"] = len(lines)
+        except Exception as e:
+            _updates_cache["count"] = {"error": str(e)}
+        _updates_cache["ts"] = now
+    return _updates_cache["count"]
+
+
+def get_public_ip():
+    """Cached hard -- this is the one call in the whole dashboard that
+    depends on an external service, so we hit it as rarely as possible."""
+    now = time.time()
+    if now - _public_ip_cache["ts"] > PUBLIC_IP_CACHE_TTL:
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
+                _public_ip_cache["ip"] = resp.read().decode().strip()
+        except Exception as e:
+            _public_ip_cache["ip"] = {"error": str(e)}
+        _public_ip_cache["ts"] = now
+    return _public_ip_cache["ip"]
+
+
+def check_internet():
+    start = time.time()
+    try:
+        s = socket.create_connection((INTERNET_CHECK_HOST, INTERNET_CHECK_PORT), timeout=3)
+        s.close()
+        return {"up": True, "latency_ms": round((time.time() - start) * 1000, 1)}
+    except Exception as e:
+        return {"up": False, "latency_ms": None, "error": str(e)}
+
+
+def play_alarm():
+    try:
+        subprocess.Popen(
+            ["aplay", ALARM_WAV], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception:
+        pass
+
+
+def internet_check_loop():
+    global _internet_state
+    while True:
+        result = check_internet()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _lock:
+            prev_up = _internet_state.get("up")
+            _internet_state = {
+                "up": result["up"],
+                "latency_ms": result.get("latency_ms"),
+                "last_checked": now,
+            }
+            if prev_up is not None and prev_up != result["up"]:
+                _internet_events.append({
+                    "time": now,
+                    "event": "Internet came back UP" if result["up"] else "Internet went DOWN",
+                })
+                del _internet_events[:-20]
+            went_down = prev_up is True and result["up"] is False
+        if went_down:
+            threading.Thread(target=play_alarm, daemon=True).start()
+        time.sleep(INTERNET_CHECK_INTERVAL)
+
+
 def get_self_vitals():
     self_id = get_self_identity()
     wifi = get_self_wifi()
@@ -132,6 +284,13 @@ def get_self_vitals():
         "temp_c": get_self_temp(),
         "voltage": get_self_voltage(),
         "throttled": get_self_throttled(),
+        "uptime": get_self_uptime(),
+        "clock": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "disk": get_self_disk(),
+        "memory": get_self_memory(),
+        "cpu_percent": get_self_cpu_percent(),
+        "updates_available": get_self_updates_available(),
+        "public_ip": get_public_ip(),
     }
 
 
@@ -368,6 +527,11 @@ DASHBOARD_HTML = """<!doctype html>
   .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-fg); }
   .status-bar { display: flex; justify-content: center; align-items: baseline; gap: 1.2rem; font-size: .72rem; color: var(--updated); flex-wrap: wrap; }
   .status-bar b { color: var(--label); font-weight: 600; }
+  .scroll-list { list-style: none; margin: .3rem 0 0; padding: 0; font-size: .75rem; overflow-y: auto; flex: 1; min-height: 0; }
+  .scroll-list li { display: flex; justify-content: space-between; gap: .5rem; padding: .2rem 0; border-top: 1px solid var(--card-border); color: var(--label); }
+  .scroll-list li:first-child { border-top: none; }
+  .scroll-list .item-name { color: var(--fg); }
+  .no-events { font-size: .75rem; color: var(--label); margin-top: .2rem; }
   .vitals-card {
     background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px;
     padding: .7rem 1rem; display: flex; flex-wrap: wrap; gap: 0 1.5rem;
@@ -389,12 +553,15 @@ DASHBOARD_HTML = """<!doctype html>
 
 <div class="vitals-card">
   <div class="card-title">This Pi (<span id="vitals-hostname">&mdash;</span>)</div>
+  <div class="vmetric"><span class="label">IP</span><span class="value" id="self-ip">&mdash;</span></div>
   <div class="vmetric"><span class="label">SSID</span><span class="value" id="self-ssid">&mdash;</span></div>
   <div class="vmetric"><span class="label">RSSI</span><span class="value" id="self-rssi">&mdash;</span></div>
   <div class="vmetric"><span class="label">Quality</span><span class="value" id="self-quality">&mdash;</span></div>
   <div class="vmetric"><span class="label">Voltage</span><span class="value" id="self-voltage">&mdash;</span></div>
   <div class="vmetric"><span class="label">Temp</span><span class="value" id="self-temp">&mdash;</span></div>
   <div class="vmetric"><span class="label">Under-voltage</span><span class="value" id="self-uv">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Uptime</span><span class="value" id="self-uptime">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Clock</span><span class="value" id="self-clock">&mdash;</span></div>
 </div>
 
 <div class="stats">
@@ -402,6 +569,21 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="stat-card online"><div class="num" id="stat-online">&mdash;</div><div class="label">Online now</div></div>
   <div class="stat-card offline"><div class="num" id="stat-offline">&mdash;</div><div class="label">Offline</div></div>
   <div class="stat-card" id="extender-card"><div class="num" id="stat-extender">&mdash;</div><div class="label" id="extender-label">Extender</div></div>
+  <div class="stat-card" id="internet-card"><div class="num" id="stat-internet">&mdash;</div><div class="label">Internet</div></div>
+</div>
+
+<div class="vitals-card">
+  <div class="card-title">System</div>
+  <div class="vmetric"><span class="label">Disk</span><span class="value" id="sys-disk">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Memory</span><span class="value" id="sys-mem">&mdash;</span></div>
+  <div class="vmetric"><span class="label">CPU</span><span class="value" id="sys-cpu">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Updates</span><span class="value" id="sys-updates">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Public IP</span><span class="value" id="sys-public-ip">&mdash;</span></div>
+</div>
+
+<div class="table-card" style="flex: 0 0 auto; max-height: 9rem;">
+  <div class="card-title">Internet Status <span style="font-weight:400;">(alarm plays police_s.wav on outage)</span></div>
+  <ul class="scroll-list" id="internet-events"></ul>
 </div>
 
 <div class="table-card">
@@ -492,6 +674,43 @@ async function refresh() {
     uvEl.textContent = uvNow ? 'yes' : 'no';
     uvEl.className = 'value ' + (uvNow ? 'bad' : 'ok');
 
+    document.getElementById('self-ip').textContent = sv.ip || '—';
+    document.getElementById('self-uptime').textContent = sv.uptime || '—';
+    document.getElementById('self-clock').textContent = sv.clock || '—';
+
+    const disk = sv.disk || {};
+    document.getElementById('sys-disk').textContent = (disk.used_gb != null ? disk.used_gb + '/' + disk.total_gb + ' GB' : '—');
+    const mem = sv.memory || {};
+    document.getElementById('sys-mem').textContent = (mem.used_mb != null ? mem.used_mb + '/' + mem.total_mb + ' MB' : '—');
+    document.getElementById('sys-cpu').textContent = (sv.cpu_percent != null ? sv.cpu_percent + ' %' : '—');
+    document.getElementById('sys-updates').textContent = (sv.updates_available != null ? sv.updates_available : '—');
+    const pubIp = sv.public_ip;
+    document.getElementById('sys-public-ip').textContent = (pubIp && !pubIp.error) ? pubIp : '—';
+
+    const net = d.internet || {};
+    const netCard = document.getElementById('internet-card');
+    const netStat = document.getElementById('stat-internet');
+    if (net.up === null || net.up === undefined) {
+      netStat.textContent = 'checking…';
+      netCard.className = 'stat-card';
+    } else {
+      netStat.textContent = net.up ? ('up · ' + net.latency_ms + 'ms') : 'DOWN';
+      netCard.className = 'stat-card ' + (net.up ? 'online' : 'offline');
+    }
+
+    const netEventsEl = document.getElementById('internet-events');
+    netEventsEl.innerHTML = '';
+    const netEvents = d.internet_events || [];
+    if (netEvents.length === 0) {
+      netEventsEl.innerHTML = '<div class="no-events">No internet up/down transitions logged yet.</div>';
+    } else {
+      for (const ev of netEvents.slice().reverse()) {
+        const li = document.createElement('li');
+        li.innerHTML = '<span class="item-name">' + ev.event + '</span><span>' + ev.time + '</span>';
+        netEventsEl.appendChild(li);
+      }
+    }
+
     const scan = d.last_scan || {};
     const statusBar = document.getElementById('status-bar');
     statusBar.innerHTML = scan.error
@@ -561,6 +780,9 @@ class Handler(BaseHTTPRequestHandler):
         if scan_info["at_epoch"] and not _scan_in_progress.is_set():
             next_in_s = max(0, round(SCAN_INTERVAL - (time.time() - scan_info["at_epoch"])))
         del scan_info["at_epoch"]
+        with _lock:
+            internet = dict(_internet_state)
+            internet_events = list(_internet_events[-10:])
         body = json.dumps({
             "devices": devices,
             "last_scan": scan_info,
@@ -568,6 +790,8 @@ class Handler(BaseHTTPRequestHandler):
             "scan_interval_s": SCAN_INTERVAL,
             "scan_in_progress": _scan_in_progress.is_set(),
             "self_vitals": get_self_vitals(),
+            "internet": internet,
+            "internet_events": internet_events,
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -591,5 +815,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=scan_loop, daemon=True).start()
+    threading.Thread(target=internet_check_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()
