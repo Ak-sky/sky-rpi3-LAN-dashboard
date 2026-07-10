@@ -29,7 +29,7 @@ VENDOR_HINTS = {
 
 _lock = threading.Lock()
 _devices_db = {}
-_last_scan = {"at": None, "duration_s": None, "hosts_up": None, "error": None}
+_last_scan = {"at": None, "at_epoch": None, "duration_s": None, "hosts_up": None, "error": None}
 
 
 def get_self_identity():
@@ -149,7 +149,7 @@ def parse_nmap_output(output, self_id):
                 hostname, ip = m.group(1), m.group(2)
             else:
                 hostname, ip = None, rest.strip()
-            current = {"ip": ip, "hostname": hostname, "mac": None, "vendor": None, "latency_ms": None}
+            current = {"ip": ip, "hostname": hostname, "mac": None, "vendor": None, "latency_ms": None, "ports": []}
         elif line.startswith("Host is up") and current:
             m = re.search(r"\(([\d.]+)s latency\)", line)
             if m:
@@ -159,6 +159,10 @@ def parse_nmap_output(output, self_id):
             if m:
                 current["mac"] = m.group(1)
                 current["vendor"] = m.group(2)
+        elif current is not None:
+            m = re.match(r"^(\d+)/tcp\s+open\s+(\S+)", line)
+            if m:
+                current["ports"].append({"port": int(m.group(1)), "service": m.group(2)})
     if current:
         devices.append(current)
 
@@ -193,12 +197,13 @@ def run_scan():
     start = time.time()
     try:
         out = subprocess.run(
-            ["sudo", "nmap", "-sn", SUBNET],
+            ["sudo", "nmap", "-T4", "--top-ports", "30", SUBNET],
             capture_output=True, text=True, timeout=90,
         ).stdout
         devices = parse_nmap_output(out, get_self_identity())
         _last_scan.update({
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "at_epoch": time.time(),
             "duration_s": round(time.time() - start, 1),
             "hosts_up": len(devices),
             "error": None,
@@ -207,6 +212,7 @@ def run_scan():
     except Exception as e:
         _last_scan.update({
             "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "at_epoch": time.time(),
             "duration_s": round(time.time() - start, 1),
             "hosts_up": None,
             "error": str(e),
@@ -253,6 +259,7 @@ def update_db(scanned_devices):
             rec["latency_ms"] = d["latency_ms"]
             rec["link"] = d["link"]
             rec["shared_mac_count"] = d["shared_mac_count"]
+            rec["ports"] = d["ports"]
             rec["last_seen"] = now
             rec["online"] = True
             _devices_db[key] = rec
@@ -263,13 +270,27 @@ def update_db(scanned_devices):
         save_db()
 
 
+_scan_trigger = threading.Event()
+_scan_in_progress = threading.Event()
+
+
+def trigger_scan():
+    if _scan_in_progress.is_set():
+        return {"ok": False, "error": "a scan is already in progress"}
+    _scan_trigger.set()
+    return {"ok": True}
+
+
 def scan_loop():
     load_db()
     while True:
+        _scan_in_progress.set()
         scanned = run_scan()
         if scanned is not None:
             update_db(scanned)
-        time.sleep(SCAN_INTERVAL)
+        _scan_in_progress.clear()
+        _scan_trigger.wait(timeout=SCAN_INTERVAL)
+        _scan_trigger.clear()
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -303,12 +324,21 @@ DASHBOARD_HTML = """<!doctype html>
   html, body { height: 100%; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    max-width: 1000px; margin: 0 auto; padding: 1.1rem;
+    width: 100%; margin: 0; padding: 1.1rem;
     color: var(--fg); background: var(--bg);
     box-sizing: border-box; height: 100vh;
-    display: flex; flex-direction: column; gap: .7rem; overflow-y: auto;
+    display: flex; flex-direction: column; gap: .7rem;
+    overflow-y: auto; overflow-x: hidden;
   }
+  .header-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
   h1 { font-size: 1.05rem; font-weight: 600; margin: 0; color: var(--label); }
+  .scan-btn {
+    font-size: .78rem; font-weight: 600; padding: .4rem .9rem;
+    border-radius: 8px; border: 1px solid var(--card-border); background: var(--card-bg);
+    color: var(--fg); cursor: pointer;
+  }
+  .scan-btn:hover { background: var(--row-hover); }
+  .scan-btn:disabled { opacity: .5; cursor: not-allowed; }
   .stats { display: flex; gap: .7rem; }
   .stat-card {
     flex: 1; background: var(--card-bg); border: 1px solid var(--card-border);
@@ -322,7 +352,7 @@ DASHBOARD_HTML = """<!doctype html>
     flex: 1; min-height: 0; background: var(--card-bg); border: 1px solid var(--card-border);
     border-radius: 12px; padding: .7rem 1rem; display: flex; flex-direction: column;
   }
-  .table-wrap { flex: 1; min-height: 0; overflow-y: auto; }
+  .table-wrap { flex: 1; min-height: 0; overflow: auto; }
   table { width: 100%; border-collapse: collapse; font-size: .82rem; }
   thead th {
     position: sticky; top: 0; background: var(--card-bg); text-align: left;
@@ -336,8 +366,8 @@ DASHBOARD_HTML = """<!doctype html>
   .pill { font-size: .68rem; padding: .18rem .5rem; border-radius: 999px; white-space: nowrap; }
   .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-fg); }
   .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-fg); }
-  .updated { font-size: .7rem; color: var(--updated); text-align: center; }
-  .note { font-size: .7rem; color: var(--label); padding: .5rem .2rem 0; line-height: 1.4; }
+  .status-bar { display: flex; justify-content: center; align-items: baseline; gap: 1.2rem; font-size: .72rem; color: var(--updated); flex-wrap: wrap; }
+  .status-bar b { color: var(--label); font-weight: 600; }
   .vitals-card {
     background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px;
     padding: .7rem 1rem; display: flex; flex-wrap: wrap; gap: 0 1.5rem;
@@ -352,10 +382,13 @@ DASHBOARD_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>LAN Devices — netmon3</h1>
+<div class="header-row">
+  <h1>LAN Devices — <span id="page-hostname">&mdash;</span></h1>
+  <button id="scan-btn" class="scan-btn">Scan Now</button>
+</div>
 
 <div class="vitals-card">
-  <div class="card-title">This Pi (netmon3)</div>
+  <div class="card-title">This Pi (<span id="vitals-hostname">&mdash;</span>)</div>
   <div class="vmetric"><span class="label">SSID</span><span class="value" id="self-ssid">&mdash;</span></div>
   <div class="vmetric"><span class="label">RSSI</span><span class="value" id="self-rssi">&mdash;</span></div>
   <div class="vmetric"><span class="label">Quality</span><span class="value" id="self-quality">&mdash;</span></div>
@@ -375,15 +408,14 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Status</th><th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th><th>Link</th><th>Latency</th><th>First Seen</th><th>Last Seen</th></tr>
+        <tr><th>Status</th><th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th><th>Link</th><th>Latency</th><th>Open Ports</th><th>First Seen</th><th>Last Seen</th></tr>
       </thead>
       <tbody id="device-rows"></tbody>
     </table>
   </div>
-  <div class="note">WiFi signal strength of *other* devices isn't available here &mdash; that requires admin access to the router/extender's own client list, which we don't have. Latency (ping RTT) is the closest honest proxy for connection quality. "Via Extender" means multiple IPs answered ARP with the same MAC in one scan &mdash; almost certainly the RE305 proxying for devices behind it, so their individual MACs aren't visible either.</div>
 </div>
 
-<div class="updated" id="updated">loading&hellip;</div>
+<div class="status-bar" id="status-bar">loading&hellip;</div>
 <script>
 async function refresh() {
   try {
@@ -409,6 +441,7 @@ async function refresh() {
       const linkPill = '<span class="pill ' + (dev.link === 'via_extender' ? 'bad' : 'ok') + '">' + linkLabel + '</span>';
       if (isExtenderHost) { extenderOnline = dev.online; extenderLatency = dev.latency_ms; }
       if (dev.link === 'via_extender' && !isExtenderHost) behindExtender++;
+      const ports = (dev.ports || []).map(p => p.port + '/' + p.service).join(', ') || '—';
       tr.innerHTML =
         '<td>' + pill + '</td>' +
         '<td>' + (dev.ip || '—') + '</td>' +
@@ -417,6 +450,7 @@ async function refresh() {
         '<td>' + (dev.vendor || 'Unknown') + '</td>' +
         '<td>' + linkPill + '</td>' +
         '<td>' + (dev.latency_ms != null ? dev.latency_ms + ' ms' : '—') + '</td>' +
+        '<td>' + ports + '</td>' +
         '<td>' + (dev.first_seen || '—') + '</td>' +
         '<td>' + (dev.last_seen || '—') + '</td>';
       rows.appendChild(tr);
@@ -434,6 +468,8 @@ async function refresh() {
     document.getElementById('extender-label').textContent = 'RE305 · ' + behindExtender + ' behind it';
 
     const sv = d.self_vitals || {};
+    document.getElementById('page-hostname').textContent = sv.hostname || 'unknown';
+    document.getElementById('vitals-hostname').textContent = sv.hostname || 'unknown';
     document.getElementById('self-ssid').textContent = sv.ssid || 'unknown';
 
     const rssiEl = document.getElementById('self-rssi');
@@ -457,14 +493,39 @@ async function refresh() {
     uvEl.className = 'value ' + (uvNow ? 'bad' : 'ok');
 
     const scan = d.last_scan || {};
-    const scanInfo = scan.error
-      ? 'last scan failed: ' + scan.error
-      : 'last scan ' + scan.at + ' (' + scan.duration_s + 's, ' + scan.hosts_up + ' up), next in ~' + d.scan_interval_s + 's';
-    document.getElementById('updated').textContent = scanInfo + ' — page updated ' + new Date().toLocaleTimeString();
+    const statusBar = document.getElementById('status-bar');
+    statusBar.innerHTML = scan.error
+      ? '<span><b>Last scan failed:</b> ' + scan.error + '</span>'
+      : '<span><b>Last scan:</b> ' + scan.at + '</span>' +
+        '<span><b>Took:</b> ' + scan.duration_s + 's</span>' +
+        '<span><b>Found:</b> ' + scan.hosts_up + ' devices</span>' +
+        '<span><b>Next scan:</b> ' + (d.scan_in_progress ? 'running now' : (d.next_scan_in_s != null ? 'in ' + d.next_scan_in_s + 's' : '—')) + '</span>';
+
+    const scanBtn = document.getElementById('scan-btn');
+    if (d.scan_in_progress) {
+      scanBtn.disabled = true;
+      scanBtn.textContent = 'Scanning…';
+    } else {
+      scanBtn.disabled = false;
+      scanBtn.textContent = 'Scan Now';
+    }
   } catch (e) {
-    document.getElementById('updated').textContent = 'fetch failed: ' + e;
+    document.getElementById('status-bar').textContent = 'fetch failed: ' + e;
   }
 }
+
+document.getElementById('scan-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('scan-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    await fetch('/scan', { method: 'POST' });
+  } catch (e) {
+    // ignore -- next refresh() will reconcile actual state
+  }
+  refresh();
+});
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -496,13 +557,32 @@ class Handler(BaseHTTPRequestHandler):
                 key=lambda r: (not r.get("online"), r.get("ip") or ""),
             )
             scan_info = dict(_last_scan)
+        next_in_s = None
+        if scan_info["at_epoch"] and not _scan_in_progress.is_set():
+            next_in_s = max(0, round(SCAN_INTERVAL - (time.time() - scan_info["at_epoch"])))
+        del scan_info["at_epoch"]
         body = json.dumps({
             "devices": devices,
             "last_scan": scan_info,
+            "next_scan_in_s": next_in_s,
             "scan_interval_s": SCAN_INTERVAL,
+            "scan_in_progress": _scan_in_progress.is_set(),
             "self_vitals": get_self_vitals(),
         }).encode()
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        if self.path != "/scan":
+            self.send_response(404)
+            self.end_headers()
+            return
+        result = trigger_scan()
+        body = json.dumps(result).encode()
+        self.send_response(200 if result.get("ok") else 409)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
