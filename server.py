@@ -4,7 +4,6 @@ thread, cached results served as JSON + a live-refreshing HTML page."""
 import json
 import os
 import re
-import shutil
 import socket
 import subprocess
 import threading
@@ -146,73 +145,6 @@ def get_self_uptime():
         return {"error": str(e)}
 
 
-def get_self_disk():
-    try:
-        total, used, free = shutil.disk_usage("/")
-        return {
-            "total_gb": round(total / 1024**3, 1),
-            "used_gb": round(used / 1024**3, 1),
-            "percent_used": round(100 * used / total, 1),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def get_self_memory():
-    try:
-        info = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                key, val = line.split(":", 1)
-                info[key] = int(val.strip().split()[0])
-        total_kb = info["MemTotal"]
-        avail_kb = info.get("MemAvailable", info["MemFree"])
-        used_kb = total_kb - avail_kb
-        return {
-            "total_mb": round(total_kb / 1024),
-            "used_mb": round(used_kb / 1024),
-            "percent_used": round(100 * used_kb / total_kb, 1),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def get_self_cpu_percent():
-    def read_idle_total():
-        with open("/proc/stat") as f:
-            fields = [int(x) for x in f.readline().split()[1:8]]
-        return fields[3], sum(fields)
-
-    try:
-        idle1, total1 = read_idle_total()
-        time.sleep(0.2)
-        idle2, total2 = read_idle_total()
-        total_delta = total2 - total1
-        if total_delta <= 0:
-            return None
-        return round(100 * (1 - (idle2 - idle1) / total_delta), 1)
-    except Exception as e:
-        return {"error": str(e)}
-
-
-_updates_cache = {"count": None, "ts": 0}
-UPDATES_CACHE_TTL = 1800
-
-
-def get_self_updates_available():
-    now = time.time()
-    if now - _updates_cache["ts"] > UPDATES_CACHE_TTL:
-        try:
-            out = subprocess.run(
-                ["apt", "list", "--upgradable"],
-                capture_output=True, text=True, timeout=15,
-            ).stdout
-            lines = [l for l in out.strip().splitlines() if not l.startswith("Listing")]
-            _updates_cache["count"] = len(lines)
-        except Exception as e:
-            _updates_cache["count"] = {"error": str(e)}
-        _updates_cache["ts"] = now
-    return _updates_cache["count"]
 
 
 def get_public_ip():
@@ -332,10 +264,6 @@ def get_self_vitals():
         "throttled": get_self_throttled(),
         "uptime": get_self_uptime(),
         "clock": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "disk": get_self_disk(),
-        "memory": get_self_memory(),
-        "cpu_percent": get_self_cpu_percent(),
-        "updates_available": get_self_updates_available(),
         "public_ip": get_public_ip(),
     }
 
@@ -608,10 +536,6 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="vmetric"><span class="label">Under-voltage</span><span class="value" id="self-uv">&mdash;</span></div>
   <div class="vmetric"><span class="label">Uptime</span><span class="value" id="self-uptime">&mdash;</span></div>
   <div class="vmetric"><span class="label">Clock</span><span class="value" id="self-clock">&mdash;</span></div>
-  <div class="vmetric"><span class="label">Disk</span><span class="value" id="sys-disk">&mdash;</span></div>
-  <div class="vmetric"><span class="label">Memory</span><span class="value" id="sys-mem">&mdash;</span></div>
-  <div class="vmetric"><span class="label">CPU</span><span class="value" id="sys-cpu">&mdash;</span></div>
-  <div class="vmetric"><span class="label">Updates</span><span class="value" id="sys-updates">&mdash;</span></div>
 </div>
 
 <div class="table-card" style="flex: 0 0 auto; max-height: 11rem;">
@@ -725,12 +649,6 @@ async function refresh() {
     document.getElementById('self-uptime').textContent = sv.uptime || '—';
     document.getElementById('self-clock').textContent = sv.clock || '—';
 
-    const disk = sv.disk || {};
-    document.getElementById('sys-disk').textContent = (disk.used_gb != null ? disk.used_gb + '/' + disk.total_gb + ' GB' : '—');
-    const mem = sv.memory || {};
-    document.getElementById('sys-mem').textContent = (mem.used_mb != null ? mem.used_mb + '/' + mem.total_mb + ' MB' : '—');
-    document.getElementById('sys-cpu').textContent = (sv.cpu_percent != null ? sv.cpu_percent + ' %' : '—');
-    document.getElementById('sys-updates').textContent = (sv.updates_available != null ? sv.updates_available : '—');
     const pubIp = sv.public_ip;
     document.getElementById('sys-public-ip').textContent = (pubIp && !pubIp.error) ? pubIp : '—';
 
