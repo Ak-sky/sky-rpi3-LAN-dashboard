@@ -598,25 +598,20 @@ DASHBOARD_HTML = """<!doctype html>
 </div>
 
 <div class="vitals-card">
-  <div class="card-title">This Pi (<span id="vitals-hostname">&mdash;</span>)</div>
   <div class="vmetric"><span class="label">IP</span><span class="value" id="self-ip">&mdash;</span></div>
   <div class="vmetric"><span class="label">SSID</span><span class="value" id="self-ssid">&mdash;</span></div>
   <div class="vmetric"><span class="label">RSSI</span><span class="value" id="self-rssi">&mdash;</span></div>
   <div class="vmetric"><span class="label">Quality</span><span class="value" id="self-quality">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Public IP</span><span class="value" id="sys-public-ip">&mdash;</span></div>
   <div class="vmetric"><span class="label">Voltage</span><span class="value" id="self-voltage">&mdash;</span></div>
   <div class="vmetric"><span class="label">Temp</span><span class="value" id="self-temp">&mdash;</span></div>
   <div class="vmetric"><span class="label">Under-voltage</span><span class="value" id="self-uv">&mdash;</span></div>
   <div class="vmetric"><span class="label">Uptime</span><span class="value" id="self-uptime">&mdash;</span></div>
   <div class="vmetric"><span class="label">Clock</span><span class="value" id="self-clock">&mdash;</span></div>
-</div>
-
-<div class="vitals-card">
-  <div class="card-title">This Pi (<span id="vitals-hostname2">&mdash;</span>) — System</div>
   <div class="vmetric"><span class="label">Disk</span><span class="value" id="sys-disk">&mdash;</span></div>
   <div class="vmetric"><span class="label">Memory</span><span class="value" id="sys-mem">&mdash;</span></div>
   <div class="vmetric"><span class="label">CPU</span><span class="value" id="sys-cpu">&mdash;</span></div>
   <div class="vmetric"><span class="label">Updates</span><span class="value" id="sys-updates">&mdash;</span></div>
-  <div class="vmetric"><span class="label">Public IP</span><span class="value" id="sys-public-ip">&mdash;</span></div>
 </div>
 
 <div class="table-card" style="flex: 0 0 auto; max-height: 11rem;">
@@ -704,8 +699,6 @@ async function refresh() {
 
     const sv = d.self_vitals || {};
     document.getElementById('page-hostname').textContent = sv.hostname || 'unknown';
-    document.getElementById('vitals-hostname').textContent = sv.hostname || 'unknown';
-    document.getElementById('vitals-hostname2').textContent = sv.hostname || 'unknown';
     document.getElementById('self-ssid').textContent = sv.ssid || 'unknown';
 
     const rssiEl = document.getElementById('self-rssi');
