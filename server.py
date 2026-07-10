@@ -272,6 +272,52 @@ def internet_check_loop():
         time.sleep(INTERNET_CHECK_INTERVAL)
 
 
+_speedtest_state = {"running": False, "at": None, "ping_ms": None, "download_mbps": None, "upload_mbps": None, "error": None}
+
+
+def run_speedtest():
+    """speedtest-cli (apt package, real Ookla infra + server selection) --
+    not a DIY download-a-file approximation. Takes ~30-40s, so this only
+    ever runs on manual trigger, never on a timer."""
+    with _lock:
+        if _speedtest_state["running"]:
+            return
+        _speedtest_state["running"] = True
+    try:
+        out = subprocess.run(
+            ["speedtest-cli", "--simple"],
+            capture_output=True, text=True, timeout=90,
+        ).stdout
+        ping = re.search(r"Ping:\s*([\d.]+)", out)
+        down = re.search(r"Download:\s*([\d.]+)", out)
+        up = re.search(r"Upload:\s*([\d.]+)", out)
+        with _lock:
+            _speedtest_state.update({
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ping_ms": float(ping.group(1)) if ping else None,
+                "download_mbps": float(down.group(1)) if down else None,
+                "upload_mbps": float(up.group(1)) if up else None,
+                "error": None if (ping and down and up) else "could not parse speedtest-cli output",
+            })
+    except Exception as e:
+        with _lock:
+            _speedtest_state.update({
+                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "error": str(e),
+            })
+    finally:
+        with _lock:
+            _speedtest_state["running"] = False
+
+
+def trigger_speedtest():
+    with _lock:
+        if _speedtest_state["running"]:
+            return {"ok": False, "error": "a speed test is already running"}
+    threading.Thread(target=run_speedtest, daemon=True).start()
+    return {"ok": True}
+
+
 def get_self_vitals():
     self_id = get_self_identity()
     wifi = get_self_wifi()
@@ -564,6 +610,24 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="vmetric"><span class="label">Clock</span><span class="value" id="self-clock">&mdash;</span></div>
 </div>
 
+<div class="vitals-card">
+  <div class="card-title">This Pi (<span id="vitals-hostname2">&mdash;</span>) — System</div>
+  <div class="vmetric"><span class="label">Disk</span><span class="value" id="sys-disk">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Memory</span><span class="value" id="sys-mem">&mdash;</span></div>
+  <div class="vmetric"><span class="label">CPU</span><span class="value" id="sys-cpu">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Updates</span><span class="value" id="sys-updates">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Public IP</span><span class="value" id="sys-public-ip">&mdash;</span></div>
+</div>
+
+<div class="table-card" style="flex: 0 0 auto; max-height: 11rem;">
+  <div class="header-row">
+    <div class="card-title">Internet Status</div>
+    <button id="speedtest-btn" class="scan-btn">Speed Test</button>
+  </div>
+  <div class="vmetric"><span class="label">Last speed test</span><span class="value" id="speedtest-result" style="font-size:.8rem;">never run</span></div>
+  <ul class="scroll-list" id="internet-events"></ul>
+</div>
+
 <div class="stats">
   <div class="stat-card"><div class="num" id="stat-total">&mdash;</div><div class="label">Known devices</div></div>
   <div class="stat-card online"><div class="num" id="stat-online">&mdash;</div><div class="label">Online now</div></div>
@@ -572,25 +636,11 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="stat-card" id="internet-card"><div class="num" id="stat-internet">&mdash;</div><div class="label">Internet</div></div>
 </div>
 
-<div class="vitals-card">
-  <div class="card-title">System</div>
-  <div class="vmetric"><span class="label">Disk</span><span class="value" id="sys-disk">&mdash;</span></div>
-  <div class="vmetric"><span class="label">Memory</span><span class="value" id="sys-mem">&mdash;</span></div>
-  <div class="vmetric"><span class="label">CPU</span><span class="value" id="sys-cpu">&mdash;</span></div>
-  <div class="vmetric"><span class="label">Updates</span><span class="value" id="sys-updates">&mdash;</span></div>
-  <div class="vmetric"><span class="label">Public IP</span><span class="value" id="sys-public-ip">&mdash;</span></div>
-</div>
-
-<div class="table-card" style="flex: 0 0 auto; max-height: 9rem;">
-  <div class="card-title">Internet Status <span style="font-weight:400;">(alarm plays police_s.wav on outage)</span></div>
-  <ul class="scroll-list" id="internet-events"></ul>
-</div>
-
 <div class="table-card">
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Status</th><th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th><th>Link</th><th>Latency</th><th>Open Ports</th><th>First Seen</th><th>Last Seen</th></tr>
+        <tr><th>#</th><th>Status</th><th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th><th>Link</th><th>Latency</th><th>Open Ports</th><th>First Seen</th><th>Last Seen</th></tr>
       </thead>
       <tbody id="device-rows"></tbody>
     </table>
@@ -612,7 +662,9 @@ async function refresh() {
     const rows = document.getElementById('device-rows');
     rows.innerHTML = '';
     let extenderOnline = null, extenderLatency = null, behindExtender = 0;
+    let rowNum = 0;
     for (const dev of devices) {
+      rowNum++;
       const tr = document.createElement('tr');
       tr.className = dev.online ? '' : 'offline';
       const pill = '<span class="pill ' + (dev.online ? 'ok">online' : 'bad">offline') + '</span>';
@@ -625,6 +677,7 @@ async function refresh() {
       if (dev.link === 'via_extender' && !isExtenderHost) behindExtender++;
       const ports = (dev.ports || []).map(p => p.port + '/' + p.service).join(', ') || '—';
       tr.innerHTML =
+        '<td>' + rowNum + '</td>' +
         '<td>' + pill + '</td>' +
         '<td>' + (dev.ip || '—') + '</td>' +
         '<td class="mac">' + (dev.mac || '—') + '</td>' +
@@ -652,6 +705,7 @@ async function refresh() {
     const sv = d.self_vitals || {};
     document.getElementById('page-hostname').textContent = sv.hostname || 'unknown';
     document.getElementById('vitals-hostname').textContent = sv.hostname || 'unknown';
+    document.getElementById('vitals-hostname2').textContent = sv.hostname || 'unknown';
     document.getElementById('self-ssid').textContent = sv.ssid || 'unknown';
 
     const rssiEl = document.getElementById('self-rssi');
@@ -728,6 +782,24 @@ async function refresh() {
       scanBtn.disabled = false;
       scanBtn.textContent = 'Scan Now';
     }
+
+    const st = d.speedtest || {};
+    const stBtn = document.getElementById('speedtest-btn');
+    const stResult = document.getElementById('speedtest-result');
+    if (st.running) {
+      stBtn.disabled = true;
+      stBtn.textContent = 'Testing… (~35s)';
+    } else {
+      stBtn.disabled = false;
+      stBtn.textContent = 'Speed Test';
+    }
+    if (st.error) {
+      stResult.textContent = 'failed: ' + st.error + (st.at ? ' (' + st.at + ')' : '');
+    } else if (st.at) {
+      stResult.textContent = 'Ping ' + st.ping_ms + 'ms · Down ' + st.download_mbps + ' Mbps · Up ' + st.upload_mbps + ' Mbps (' + st.at + ')';
+    } else {
+      stResult.textContent = 'never run';
+    }
   } catch (e) {
     document.getElementById('status-bar').textContent = 'fetch failed: ' + e;
   }
@@ -739,6 +811,18 @@ document.getElementById('scan-btn').addEventListener('click', async () => {
   btn.textContent = 'Starting…';
   try {
     await fetch('/scan', { method: 'POST' });
+  } catch (e) {
+    // ignore -- next refresh() will reconcile actual state
+  }
+  refresh();
+});
+
+document.getElementById('speedtest-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('speedtest-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    await fetch('/speedtest', { method: 'POST' });
   } catch (e) {
     // ignore -- next refresh() will reconcile actual state
   }
@@ -783,6 +867,7 @@ class Handler(BaseHTTPRequestHandler):
         with _lock:
             internet = dict(_internet_state)
             internet_events = list(_internet_events[-10:])
+            speedtest = dict(_speedtest_state)
         body = json.dumps({
             "devices": devices,
             "last_scan": scan_info,
@@ -792,6 +877,7 @@ class Handler(BaseHTTPRequestHandler):
             "self_vitals": get_self_vitals(),
             "internet": internet,
             "internet_events": internet_events,
+            "speedtest": speedtest,
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -800,11 +886,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path != "/scan":
+        if self.path == "/scan":
+            result = trigger_scan()
+        elif self.path == "/speedtest":
+            result = trigger_speedtest()
+        else:
             self.send_response(404)
             self.end_headers()
             return
-        result = trigger_scan()
         body = json.dumps(result).encode()
         self.send_response(200 if result.get("ok") else 409)
         self.send_header("Content-Type", "application/json")
