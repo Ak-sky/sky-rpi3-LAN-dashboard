@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""Minimal stdlib-only LAN device dashboard: nmap scan in a background
+thread, cached results served as JSON + a live-refreshing HTML page."""
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = 8000
+SUBNET = "192.168.1.0/24"
+SCAN_INTERVAL = 90  # seconds; a full /24 sweep takes ~20-25s on a Pi 3
+DB_PATH = os.path.expanduser("~/lan-dashboard-data/devices.json")
+
+WIFI_IFACE = "wlan0"
+
+# nmap's bundled OUI DB (esp. on older versions) misses a lot of consumer
+# gear -- this is just a tiny supplement for prefixes we know matter here,
+# not an attempt at a full vendor database.
+VENDOR_HINTS = {
+    "b8:27:eb": "Raspberry Pi Foundation",
+    "dc:a6:32": "Raspberry Pi Trading",
+    "e4:5f:01": "Raspberry Pi Trading",
+    "28:cd:c1": "Raspberry Pi Trading",
+}
+
+_lock = threading.Lock()
+_devices_db = {}
+_last_scan = {"at": None, "duration_s": None, "hosts_up": None, "error": None}
+
+
+def get_self_identity():
+    try:
+        out = subprocess.run(
+            ["ip", "-o", "link", "show", WIFI_IFACE],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        m = re.search(r"link/ether ([0-9a-fA-F:]+)", out)
+        mac = m.group(1).upper() if m else None
+    except Exception:
+        mac = None
+    try:
+        ip_out = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show", WIFI_IFACE],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
+        ip = m.group(1) if m else None
+    except Exception:
+        ip = None
+    hostname = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
+    return {"ip": ip, "mac": mac, "hostname": hostname}
+
+
+def run_vcgencmd(*args):
+    try:
+        return subprocess.run(
+            ["vcgencmd", *args], capture_output=True, text=True, timeout=3
+        ).stdout.strip()
+    except Exception as e:
+        return f"error: {e}"
+
+
+def get_self_wifi():
+    try:
+        with open("/proc/net/wireless") as f:
+            for line in f:
+                if line.strip().startswith(WIFI_IFACE):
+                    fields = line.split()
+                    quality = float(fields[2].rstrip("."))
+                    level = float(fields[3].rstrip("."))
+                    return {"rssi_dbm": level, "link_quality_pct": round(quality / 70 * 100, 1)}
+    except Exception as e:
+        return {"error": str(e)}
+    return {"rssi_dbm": None, "link_quality_pct": None}
+
+
+def get_self_ssid():
+    """This Pi runs plain wpa_supplicant, not NetworkManager (nmcli errors
+    with "NetworkManager is not running"), so query wpa_cli directly."""
+    try:
+        out = subprocess.run(
+            ["sudo", "wpa_cli", "-i", WIFI_IFACE, "status"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            if line.startswith("ssid="):
+                return line.split("=", 1)[1]
+    except Exception as e:
+        return {"error": str(e)}
+    return None
+
+
+def get_self_temp():
+    raw = run_vcgencmd("measure_temp")
+    m = re.search(r"temp=([\d.]+)", raw)
+    return float(m.group(1)) if m else raw
+
+
+def get_self_voltage():
+    raw = run_vcgencmd("measure_volts")
+    m = re.search(r"volt=([\d.]+)V", raw)
+    return float(m.group(1)) if m else raw
+
+
+def get_self_throttled():
+    raw = run_vcgencmd("get_throttled")
+    m = re.search(r"throttled=0x([0-9a-fA-F]+)", raw)
+    if not m:
+        return {"raw": raw}
+    val = int(m.group(1), 16)
+    return {
+        "raw": hex(val),
+        "under_voltage_now": bool(val & (1 << 0)),
+        "under_voltage_occurred": bool(val & (1 << 16)),
+        "throttling_occurred": bool(val & (1 << 18)),
+    }
+
+
+def get_self_vitals():
+    self_id = get_self_identity()
+    wifi = get_self_wifi()
+    return {
+        "hostname": self_id["hostname"],
+        "ip": self_id["ip"],
+        "ssid": get_self_ssid(),
+        "rssi_dbm": wifi.get("rssi_dbm"),
+        "link_quality_pct": wifi.get("link_quality_pct"),
+        "temp_c": get_self_temp(),
+        "voltage": get_self_voltage(),
+        "throttled": get_self_throttled(),
+    }
+
+
+def parse_nmap_output(output, self_id):
+    devices = []
+    current = None
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("Nmap scan report for"):
+            if current:
+                devices.append(current)
+            rest = line[len("Nmap scan report for "):]
+            m = re.match(r"^(.*) \((\d+\.\d+\.\d+\.\d+)\)$", rest)
+            if m:
+                hostname, ip = m.group(1), m.group(2)
+            else:
+                hostname, ip = None, rest.strip()
+            current = {"ip": ip, "hostname": hostname, "mac": None, "vendor": None, "latency_ms": None}
+        elif line.startswith("Host is up") and current:
+            m = re.search(r"\(([\d.]+)s latency\)", line)
+            if m:
+                current["latency_ms"] = round(float(m.group(1)) * 1000, 1)
+        elif line.startswith("MAC Address:") and current:
+            m = re.match(r"MAC Address: ([0-9A-Fa-f:]+) \(([^)]*)\)", line)
+            if m:
+                current["mac"] = m.group(1)
+                current["vendor"] = m.group(2)
+    if current:
+        devices.append(current)
+
+    for d in devices:
+        if self_id["ip"] and d["ip"] == self_id["ip"]:
+            # nmap's own local-resolver guess for the scanning host is
+            # unreliable (mDNS/DNS cache artifacts) -- we know this one
+            # authoritatively, so it always wins.
+            d["mac"] = d["mac"] or self_id["mac"]
+            d["hostname"] = self_id["hostname"]
+        if d["mac"]:
+            prefix = d["mac"][:8].lower()
+            if prefix in VENDOR_HINTS:
+                d["vendor"] = VENDOR_HINTS[prefix]
+
+    # A MAC answering ARP for more than one IP in the same scan is a
+    # WiFi extender/repeater proxy-ARPing for the devices behind it --
+    # we can't see those devices' real MACs, only the extender's.
+    mac_counts = {}
+    for d in devices:
+        if d["mac"]:
+            mac_counts[d["mac"]] = mac_counts.get(d["mac"], 0) + 1
+    for d in devices:
+        group_size = mac_counts.get(d["mac"], 1) if d["mac"] else 1
+        d["link"] = "via_extender" if group_size > 1 else "direct"
+        d["shared_mac_count"] = group_size
+
+    return devices
+
+
+def run_scan():
+    start = time.time()
+    try:
+        out = subprocess.run(
+            ["sudo", "nmap", "-sn", SUBNET],
+            capture_output=True, text=True, timeout=90,
+        ).stdout
+        devices = parse_nmap_output(out, get_self_identity())
+        _last_scan.update({
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_s": round(time.time() - start, 1),
+            "hosts_up": len(devices),
+            "error": None,
+        })
+        return devices
+    except Exception as e:
+        _last_scan.update({
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_s": round(time.time() - start, 1),
+            "hosts_up": None,
+            "error": str(e),
+        })
+        return None
+
+
+def load_db():
+    global _devices_db
+    try:
+        with open(DB_PATH) as f:
+            _devices_db = json.load(f)
+    except Exception:
+        _devices_db = {}
+
+
+def save_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    tmp = DB_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(_devices_db, f, indent=2)
+    os.replace(tmp, DB_PATH)
+
+
+def update_db(scanned_devices):
+    """Keyed by IP, not MAC: a WiFi repeater/mesh node on this network
+    (RE305) answers ARP for several IPs under one MAC, and keying by MAC
+    collapsed those into a single overwritten row -- exactly the kind of
+    wrong-IP bug this dashboard exists to avoid."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    seen_keys = set()
+    with _lock:
+        for d in scanned_devices:
+            key = d["ip"]
+            seen_keys.add(key)
+            rec = _devices_db.get(key, {"first_seen": now})
+            rec["ip"] = d["ip"]
+            rec["mac"] = d["mac"]
+            rec["hostname"] = d["hostname"] or rec.get("hostname")
+            if d["vendor"] and d["vendor"] != "Unknown":
+                rec["vendor"] = d["vendor"]
+            else:
+                rec.setdefault("vendor", d["vendor"])
+            rec["latency_ms"] = d["latency_ms"]
+            rec["link"] = d["link"]
+            rec["shared_mac_count"] = d["shared_mac_count"]
+            rec["last_seen"] = now
+            rec["online"] = True
+            _devices_db[key] = rec
+        for key, rec in _devices_db.items():
+            if key not in seen_keys:
+                rec["online"] = False
+                rec["latency_ms"] = None
+        save_db()
+
+
+def scan_loop():
+    load_db()
+    while True:
+        scanned = run_scan()
+        if scanned is not None:
+            update_db(scanned)
+        time.sleep(SCAN_INTERVAL)
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LAN Devices</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fafafa; --fg: #1a1a1a;
+    --card-bg: #fff; --card-border: #e5e5e5;
+    --label: rgba(0,0,0,.55); --updated: rgba(0,0,0,.4);
+    --pill-ok-bg: #e6f7ea; --pill-ok-fg: #1a7a34;
+    --pill-bad-bg: #fbe6e6; --pill-bad-fg: #b31f1f;
+    --warn-fg: #9a6b00;
+    --row-hover: #f5f5f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121212; --fg: #e8e8e8;
+      --card-bg: #1e1e1e; --card-border: #333;
+      --label: rgba(255,255,255,.55); --updated: rgba(255,255,255,.4);
+      --pill-ok-bg: #123a1f; --pill-ok-fg: #7ee08a;
+      --pill-bad-bg: #3a1212; --pill-bad-fg: #ff8a8a;
+      --warn-fg: #e0b34d;
+      --row-hover: #262626;
+    }
+  }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 1000px; margin: 0 auto; padding: 1.1rem;
+    color: var(--fg); background: var(--bg);
+    box-sizing: border-box; height: 100vh;
+    display: flex; flex-direction: column; gap: .7rem; overflow-y: auto;
+  }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0; color: var(--label); }
+  .stats { display: flex; gap: .7rem; }
+  .stat-card {
+    flex: 1; background: var(--card-bg); border: 1px solid var(--card-border);
+    border-radius: 12px; padding: .7rem 1rem;
+  }
+  .stat-card .num { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat-card .label { font-size: .75rem; color: var(--label); }
+  .stat-card.online .num { color: var(--pill-ok-fg); }
+  .stat-card.offline .num { color: var(--pill-bad-fg); }
+  .table-card {
+    flex: 1; min-height: 0; background: var(--card-bg); border: 1px solid var(--card-border);
+    border-radius: 12px; padding: .7rem 1rem; display: flex; flex-direction: column;
+  }
+  .table-wrap { flex: 1; min-height: 0; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+  thead th {
+    position: sticky; top: 0; background: var(--card-bg); text-align: left;
+    color: var(--label); font-weight: 600; font-size: .74rem; padding: .4rem .5rem;
+    border-bottom: 1px solid var(--card-border);
+  }
+  tbody td { padding: .4rem .5rem; border-bottom: 1px solid var(--card-border); white-space: nowrap; }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody tr.offline { opacity: .5; }
+  .mac { font-variant-numeric: tabular-nums; }
+  .pill { font-size: .68rem; padding: .18rem .5rem; border-radius: 999px; white-space: nowrap; }
+  .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-fg); }
+  .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-fg); }
+  .updated { font-size: .7rem; color: var(--updated); text-align: center; }
+  .note { font-size: .7rem; color: var(--label); padding: .5rem .2rem 0; line-height: 1.4; }
+  .vitals-card {
+    background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px;
+    padding: .7rem 1rem; display: flex; flex-wrap: wrap; gap: 0 1.5rem;
+  }
+  .vitals-card .card-title { flex-basis: 100%; font-size: .78rem; color: var(--label); font-weight: 600; margin-bottom: .2rem; }
+  .vmetric { display: flex; align-items: baseline; gap: .4rem; padding: .15rem 0; }
+  .vmetric .label { color: var(--label); font-size: .74rem; }
+  .vmetric .value { color: var(--fg); font-size: .88rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .vmetric .value.ok { color: var(--pill-ok-fg); }
+  .vmetric .value.warn { color: var(--warn-fg); }
+  .vmetric .value.bad { color: var(--pill-bad-fg); }
+</style>
+</head>
+<body>
+<h1>LAN Devices — netmon3</h1>
+
+<div class="vitals-card">
+  <div class="card-title">This Pi (netmon3)</div>
+  <div class="vmetric"><span class="label">SSID</span><span class="value" id="self-ssid">&mdash;</span></div>
+  <div class="vmetric"><span class="label">RSSI</span><span class="value" id="self-rssi">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Quality</span><span class="value" id="self-quality">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Voltage</span><span class="value" id="self-voltage">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Temp</span><span class="value" id="self-temp">&mdash;</span></div>
+  <div class="vmetric"><span class="label">Under-voltage</span><span class="value" id="self-uv">&mdash;</span></div>
+</div>
+
+<div class="stats">
+  <div class="stat-card"><div class="num" id="stat-total">&mdash;</div><div class="label">Known devices</div></div>
+  <div class="stat-card online"><div class="num" id="stat-online">&mdash;</div><div class="label">Online now</div></div>
+  <div class="stat-card offline"><div class="num" id="stat-offline">&mdash;</div><div class="label">Offline</div></div>
+  <div class="stat-card" id="extender-card"><div class="num" id="stat-extender">&mdash;</div><div class="label" id="extender-label">Extender</div></div>
+</div>
+
+<div class="table-card">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Status</th><th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th><th>Link</th><th>Latency</th><th>First Seen</th><th>Last Seen</th></tr>
+      </thead>
+      <tbody id="device-rows"></tbody>
+    </table>
+  </div>
+  <div class="note">WiFi signal strength of *other* devices isn't available here &mdash; that requires admin access to the router/extender's own client list, which we don't have. Latency (ping RTT) is the closest honest proxy for connection quality. "Via Extender" means multiple IPs answered ARP with the same MAC in one scan &mdash; almost certainly the RE305 proxying for devices behind it, so their individual MACs aren't visible either.</div>
+</div>
+
+<div class="updated" id="updated">loading&hellip;</div>
+<script>
+async function refresh() {
+  try {
+    const r = await fetch('/devices');
+    const d = await r.json();
+    const devices = d.devices || [];
+
+    document.getElementById('stat-total').textContent = devices.length;
+    document.getElementById('stat-online').textContent = devices.filter(x => x.online).length;
+    document.getElementById('stat-offline').textContent = devices.filter(x => !x.online).length;
+
+    const rows = document.getElementById('device-rows');
+    rows.innerHTML = '';
+    let extenderOnline = null, extenderLatency = null, behindExtender = 0;
+    for (const dev of devices) {
+      const tr = document.createElement('tr');
+      tr.className = dev.online ? '' : 'offline';
+      const pill = '<span class="pill ' + (dev.online ? 'ok">online' : 'bad">offline') + '</span>';
+      const isExtenderHost = dev.hostname && dev.hostname.toUpperCase().includes('RE305');
+      const linkLabel = dev.link === 'via_extender'
+        ? (isExtenderHost ? 'Extender' : 'Via Extender')
+        : 'Direct';
+      const linkPill = '<span class="pill ' + (dev.link === 'via_extender' ? 'bad' : 'ok') + '">' + linkLabel + '</span>';
+      if (isExtenderHost) { extenderOnline = dev.online; extenderLatency = dev.latency_ms; }
+      if (dev.link === 'via_extender' && !isExtenderHost) behindExtender++;
+      tr.innerHTML =
+        '<td>' + pill + '</td>' +
+        '<td>' + (dev.ip || '—') + '</td>' +
+        '<td class="mac">' + (dev.mac || '—') + '</td>' +
+        '<td>' + (dev.hostname || '—') + '</td>' +
+        '<td>' + (dev.vendor || 'Unknown') + '</td>' +
+        '<td>' + linkPill + '</td>' +
+        '<td>' + (dev.latency_ms != null ? dev.latency_ms + ' ms' : '—') + '</td>' +
+        '<td>' + (dev.first_seen || '—') + '</td>' +
+        '<td>' + (dev.last_seen || '—') + '</td>';
+      rows.appendChild(tr);
+    }
+
+    const extCard = document.getElementById('extender-card');
+    const extNum = document.getElementById('stat-extender');
+    if (extenderOnline === null) {
+      extNum.textContent = 'not seen';
+      extCard.className = 'stat-card';
+    } else {
+      extNum.textContent = (extenderOnline ? 'online' : 'offline') + (extenderLatency != null ? ' · ' + extenderLatency + 'ms' : '');
+      extCard.className = 'stat-card ' + (extenderOnline ? 'online' : 'offline');
+    }
+    document.getElementById('extender-label').textContent = 'RE305 · ' + behindExtender + ' behind it';
+
+    const sv = d.self_vitals || {};
+    document.getElementById('self-ssid').textContent = sv.ssid || 'unknown';
+
+    const rssiEl = document.getElementById('self-rssi');
+    rssiEl.textContent = (sv.rssi_dbm != null ? sv.rssi_dbm + ' dBm' : '—');
+    rssiEl.className = 'value ' + (sv.rssi_dbm >= -60 ? 'ok' : sv.rssi_dbm >= -70 ? 'warn' : 'bad');
+
+    const qEl = document.getElementById('self-quality');
+    const q = sv.link_quality_pct;
+    qEl.textContent = (q != null ? q + '%' : '—');
+    qEl.className = 'value ' + (q == null ? '' : q >= 70 ? 'ok' : q >= 40 ? 'warn' : 'bad');
+
+    document.getElementById('self-voltage').textContent = (sv.voltage != null ? sv.voltage + ' V' : '—');
+
+    const tempEl = document.getElementById('self-temp');
+    tempEl.textContent = (sv.temp_c != null ? sv.temp_c + ' °C' : '—');
+    tempEl.className = 'value ' + (sv.temp_c == null ? '' : sv.temp_c < 60 ? 'ok' : sv.temp_c < 70 ? 'warn' : 'bad');
+
+    const uvEl = document.getElementById('self-uv');
+    const uvNow = sv.throttled && sv.throttled.under_voltage_now;
+    uvEl.textContent = uvNow ? 'yes' : 'no';
+    uvEl.className = 'value ' + (uvNow ? 'bad' : 'ok');
+
+    const scan = d.last_scan || {};
+    const scanInfo = scan.error
+      ? 'last scan failed: ' + scan.error
+      : 'last scan ' + scan.at + ' (' + scan.duration_s + 's, ' + scan.hosts_up + ' up), next in ~' + d.scan_interval_s + 's';
+    document.getElementById('updated').textContent = scanInfo + ' — page updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('updated').textContent = 'fetch failed: ' + e;
+  }
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/":
+            body = DASHBOARD_HTML.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path != "/devices":
+            self.send_response(404)
+            self.end_headers()
+            return
+        with _lock:
+            devices = sorted(
+                _devices_db.values(),
+                key=lambda r: (not r.get("online"), r.get("ip") or ""),
+            )
+            scan_info = dict(_last_scan)
+        body = json.dumps({
+            "devices": devices,
+            "last_scan": scan_info,
+            "scan_interval_s": SCAN_INTERVAL,
+            "self_vitals": get_self_vitals(),
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+if __name__ == "__main__":
+    threading.Thread(target=scan_loop, daemon=True).start()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()

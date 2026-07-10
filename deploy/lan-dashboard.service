@@ -1,0 +1,13 @@
+[Unit]
+Description=LAN device dashboard (nmap scan + this Pi's vitals)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/lan-dashboard/server.py
+Restart=always
+RestartSec=2
+User=pi
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
