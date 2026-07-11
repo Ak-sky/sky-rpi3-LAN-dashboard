@@ -478,6 +478,14 @@ DASHBOARD_HTML = """<!doctype html>
   }
   .scan-btn:hover { background: var(--row-hover); }
   .scan-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .filter-bar { display: flex; align-items: center; gap: .6rem; margin-bottom: .6rem; flex-wrap: wrap; }
+  .filter-search, .filter-select {
+    font-size: .8rem; padding: .4rem .6rem; border-radius: 8px;
+    border: 1px solid var(--card-border); background: var(--bg); color: var(--fg);
+  }
+  .filter-search { flex: 1; min-width: 12rem; }
+  .filter-search:focus, .filter-select:focus { outline: 1px solid var(--label); }
+  .filter-count { font-size: .75rem; color: var(--label); white-space: nowrap; margin-left: auto; }
   .stats { display: flex; gap: .7rem; }
   .stat-card {
     flex: 1; background: var(--card-bg); border: 1px solid var(--card-border);
@@ -571,6 +579,21 @@ DASHBOARD_HTML = """<!doctype html>
 </div>
 
 <div class="table-card">
+  <div class="filter-bar">
+    <input type="text" id="filter-search" class="filter-search" placeholder="Search IP, MAC, hostname, vendor…">
+    <select id="filter-status" class="filter-select">
+      <option value="all">All statuses</option>
+      <option value="online">Online</option>
+      <option value="offline">Offline</option>
+    </select>
+    <select id="filter-link" class="filter-select">
+      <option value="all">All links</option>
+      <option value="direct">Direct</option>
+      <option value="via_extender">Via Extender</option>
+      <option value="extender">Extender</option>
+    </select>
+    <span class="filter-count" id="filter-count"></span>
+  </div>
   <div class="table-wrap">
     <table>
       <thead>
@@ -591,46 +614,85 @@ function formatDuration(seconds) {
   return h + 'h ' + (m % 60) + 'm';
 }
 
+let lastDevices = [];
+
+function deviceLinkKind(dev) {
+  const isExtenderHost = dev.hostname && dev.hostname.toUpperCase().includes('RE305');
+  if (dev.link !== 'via_extender') return 'direct';
+  return isExtenderHost ? 'extender' : 'via_extender';
+}
+
+function renderDeviceRows() {
+  const search = document.getElementById('filter-search').value.trim().toLowerCase();
+  const statusFilter = document.getElementById('filter-status').value;
+  const linkFilter = document.getElementById('filter-link').value;
+
+  const filtered = lastDevices.filter(dev => {
+    if (statusFilter === 'online' && !dev.online) return false;
+    if (statusFilter === 'offline' && dev.online) return false;
+    if (linkFilter !== 'all' && deviceLinkKind(dev) !== linkFilter) return false;
+    if (search) {
+      const haystack = [dev.ip, dev.mac, dev.hostname, dev.vendor].filter(Boolean).join(' ').toLowerCase();
+      if (!haystack.includes(search)) return false;
+    }
+    return true;
+  });
+
+  document.getElementById('filter-count').textContent =
+    filtered.length === lastDevices.length
+      ? lastDevices.length + ' devices'
+      : 'showing ' + filtered.length + ' of ' + lastDevices.length + ' devices';
+
+  const rows = document.getElementById('device-rows');
+  rows.innerHTML = '';
+  let rowNum = 0;
+  for (const dev of filtered) {
+    rowNum++;
+    const tr = document.createElement('tr');
+    tr.className = dev.online ? '' : 'offline';
+    const pill = '<span class="pill ' + (dev.online ? 'ok">online' : 'bad">offline') + '</span>';
+    const linkKind = deviceLinkKind(dev);
+    const linkLabel = linkKind === 'extender' ? 'Extender' : linkKind === 'via_extender' ? 'Via Extender' : 'Direct';
+    const linkPill = '<span class="pill ' + (linkKind === 'direct' ? 'ok' : 'bad') + '">' + linkLabel + '</span>';
+    const ports = (dev.ports || []).map(p => p.port + '/' + p.service).join(', ') || '—';
+    tr.innerHTML =
+      '<td>' + rowNum + '</td>' +
+      '<td>' + pill + '</td>' +
+      '<td>' + (dev.ip || '—') + '</td>' +
+      '<td class="mac">' + (dev.mac || '—') + '</td>' +
+      '<td>' + (dev.hostname || '—') + '</td>' +
+      '<td>' + (dev.vendor || 'Unknown') + '</td>' +
+      '<td>' + linkPill + '</td>' +
+      '<td>' + (dev.latency_ms != null ? dev.latency_ms + ' ms' : '—') + '</td>' +
+      '<td>' + ports + '</td>' +
+      '<td>' + (dev.first_seen || '—') + '</td>' +
+      '<td>' + (dev.last_seen || '—') + '</td>';
+    rows.appendChild(tr);
+  }
+}
+
+document.getElementById('filter-search').addEventListener('input', renderDeviceRows);
+document.getElementById('filter-status').addEventListener('change', renderDeviceRows);
+document.getElementById('filter-link').addEventListener('change', renderDeviceRows);
+
 async function refresh() {
   try {
     const r = await fetch('/devices');
     const d = await r.json();
     const devices = d.devices || [];
+    lastDevices = devices;
 
     document.getElementById('stat-total').textContent = devices.length;
     document.getElementById('stat-online').textContent = devices.filter(x => x.online).length;
     document.getElementById('stat-offline').textContent = devices.filter(x => !x.online).length;
 
-    const rows = document.getElementById('device-rows');
-    rows.innerHTML = '';
+    renderDeviceRows();
+
     let extenderOnline = null, extenderLatency = null, behindExtender = 0;
-    let rowNum = 0;
     for (const dev of devices) {
-      rowNum++;
-      const tr = document.createElement('tr');
-      tr.className = dev.online ? '' : 'offline';
-      const pill = '<span class="pill ' + (dev.online ? 'ok">online' : 'bad">offline') + '</span>';
-      const isExtenderHost = dev.hostname && dev.hostname.toUpperCase().includes('RE305');
-      const linkLabel = dev.link === 'via_extender'
-        ? (isExtenderHost ? 'Extender' : 'Via Extender')
-        : 'Direct';
-      const linkPill = '<span class="pill ' + (dev.link === 'via_extender' ? 'bad' : 'ok') + '">' + linkLabel + '</span>';
-      if (isExtenderHost) { extenderOnline = dev.online; extenderLatency = dev.latency_ms; }
-      if (dev.link === 'via_extender' && !isExtenderHost) behindExtender++;
-      const ports = (dev.ports || []).map(p => p.port + '/' + p.service).join(', ') || '—';
-      tr.innerHTML =
-        '<td>' + rowNum + '</td>' +
-        '<td>' + pill + '</td>' +
-        '<td>' + (dev.ip || '—') + '</td>' +
-        '<td class="mac">' + (dev.mac || '—') + '</td>' +
-        '<td>' + (dev.hostname || '—') + '</td>' +
-        '<td>' + (dev.vendor || 'Unknown') + '</td>' +
-        '<td>' + linkPill + '</td>' +
-        '<td>' + (dev.latency_ms != null ? dev.latency_ms + ' ms' : '—') + '</td>' +
-        '<td>' + ports + '</td>' +
-        '<td>' + (dev.first_seen || '—') + '</td>' +
-        '<td>' + (dev.last_seen || '—') + '</td>';
-      rows.appendChild(tr);
+      const linkKind = deviceLinkKind(dev);
+      if (linkKind === 'extender') { extenderOnline = dev.online; extenderLatency = dev.latency_ms; }
+      if (linkKind === 'via_extender') behindExtender++;
     }
 
     const extCard = document.getElementById('extender-card');
