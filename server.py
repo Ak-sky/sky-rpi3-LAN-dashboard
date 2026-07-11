@@ -180,11 +180,15 @@ def play_alarm():
         pass
 
 
+_last_down_epoch = None
+
+
 def internet_check_loop():
-    global _internet_state
+    global _internet_state, _last_down_epoch
     while True:
         result = check_internet()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_epoch = time.time()
         with _lock:
             prev_up = _internet_state.get("up")
             _internet_state = {
@@ -193,10 +197,12 @@ def internet_check_loop():
                 "last_checked": now,
             }
             if prev_up is not None and prev_up != result["up"]:
-                _internet_events.append({
-                    "time": now,
-                    "event": "Internet came back UP" if result["up"] else "Internet went DOWN",
-                })
+                event = {"time": now, "type": "up" if result["up"] else "down"}
+                if result["up"] and _last_down_epoch:
+                    event["duration_s"] = round(now_epoch - _last_down_epoch)
+                if not result["up"]:
+                    _last_down_epoch = now_epoch
+                _internet_events.append(event)
                 del _internet_events[:-20]
             went_down = prev_up is True and result["up"] is False
         if went_down:
@@ -506,6 +512,15 @@ DASHBOARD_HTML = """<!doctype html>
   .scroll-list li:first-child { border-top: none; }
   .scroll-list .item-name { color: var(--fg); }
   .no-events { font-size: .75rem; color: var(--label); margin-top: .2rem; }
+  .net-event { border-left: 2px solid transparent; padding-left: .5rem !important; margin-left: -.5rem; }
+  .net-event-up { border-left-color: var(--pill-ok-fg); }
+  .net-event-down { border-left-color: var(--pill-bad-fg); }
+  .net-event .event-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: .45rem; vertical-align: middle; }
+  .net-event-up .event-dot { background: var(--pill-ok-fg); }
+  .net-event-down .event-dot { background: var(--pill-bad-fg); }
+  .net-event-up .item-name { color: var(--pill-ok-fg); }
+  .net-event-down .item-name { color: var(--pill-bad-fg); }
+  .duration-badge { margin-left: .5rem; font-size: .68rem; color: var(--label); font-weight: 400; }
   .vitals-card {
     background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px;
     padding: .7rem 1rem; display: flex; flex-wrap: wrap; gap: 0 1.5rem;
@@ -568,6 +583,14 @@ DASHBOARD_HTML = """<!doctype html>
 
 <div class="status-bar" id="status-bar">loading&hellip;</div>
 <script>
+function formatDuration(seconds) {
+  if (seconds < 60) return seconds + 's';
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  if (m < 60) return m + 'm ' + s + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
+}
+
 async function refresh() {
   try {
     const r = await fetch('/devices');
@@ -671,7 +694,13 @@ async function refresh() {
     } else {
       for (const ev of netEvents.slice().reverse()) {
         const li = document.createElement('li');
-        li.innerHTML = '<span class="item-name">' + ev.event + '</span><span>' + ev.time + '</span>';
+        li.className = 'net-event net-event-' + ev.type;
+        const label = ev.type === 'up' ? 'Internet Up' : 'Internet Down';
+        const duration = (ev.type === 'up' && ev.duration_s != null)
+          ? '<span class="duration-badge">outage lasted ' + formatDuration(ev.duration_s) + '</span>' : '';
+        li.innerHTML =
+          '<span class="item-name"><span class="event-dot"></span>' + label + duration + '</span>' +
+          '<span>' + ev.time + '</span>';
         netEventsEl.appendChild(li);
       }
     }
