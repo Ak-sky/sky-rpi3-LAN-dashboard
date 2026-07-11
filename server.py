@@ -506,6 +506,11 @@ DASHBOARD_HTML = """<!doctype html>
     color: var(--label); font-weight: 600; font-size: .74rem; padding: .4rem .5rem;
     border-bottom: 1px solid var(--card-border);
   }
+  thead th[data-field] { cursor: pointer; user-select: none; }
+  thead th[data-field]:hover { color: var(--fg); }
+  thead th[data-field]::after { content: ''; display: inline-block; width: .6em; }
+  thead th.sort-asc::after { content: '▲'; font-size: .65em; margin-left: .2em; }
+  thead th.sort-desc::after { content: '▼'; font-size: .65em; margin-left: .2em; }
   tbody td { padding: .4rem .5rem; border-bottom: 1px solid var(--card-border); white-space: nowrap; }
   tbody tr:hover { background: var(--row-hover); }
   tbody tr.offline { opacity: .5; }
@@ -597,7 +602,19 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>#</th><th>Status</th><th>IP</th><th>MAC</th><th>Hostname</th><th>Vendor</th><th>Link</th><th>Latency</th><th>Open Ports</th><th>First Seen</th><th>Last Seen</th></tr>
+        <tr>
+          <th>#</th>
+          <th data-field="online" data-type="bool">Status</th>
+          <th data-field="ip" data-type="ip">IP</th>
+          <th data-field="mac" data-type="string">MAC</th>
+          <th data-field="hostname" data-type="string">Hostname</th>
+          <th data-field="vendor" data-type="string">Vendor</th>
+          <th data-field="link" data-type="string">Link</th>
+          <th data-field="latency_ms" data-type="number">Latency</th>
+          <th data-field="ports" data-type="number">Open Ports</th>
+          <th data-field="first_seen" data-type="string">First Seen</th>
+          <th data-field="last_seen" data-type="string">Last Seen</th>
+        </tr>
       </thead>
       <tbody id="device-rows"></tbody>
     </table>
@@ -615,12 +632,49 @@ function formatDuration(seconds) {
 }
 
 let lastDevices = [];
+let sortState = { field: null, dir: 1 };
 
 function deviceLinkKind(dev) {
   const isExtenderHost = dev.hostname && dev.hostname.toUpperCase().includes('RE305');
   if (dev.link !== 'via_extender') return 'direct';
   return isExtenderHost ? 'extender' : 'via_extender';
 }
+
+function sortFieldValue(dev, field) {
+  if (field === 'link') return deviceLinkKind(dev);
+  if (field === 'ports') return (dev.ports || []).length;
+  if (field === 'online') return dev.online ? 1 : 0;
+  return dev[field];
+}
+
+function compareIp(a, b) {
+  const pa = (a || '0.0.0.0').split('.').map(Number);
+  const pb = (b || '0.0.0.0').split('.').map(Number);
+  for (let i = 0; i < 4; i++) {
+    if (pa[i] !== pb[i]) return pa[i] - pb[i];
+  }
+  return 0;
+}
+
+function compareValues(a, b, type) {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1;
+  if (b == null) return -1;
+  if (type === 'ip') return compareIp(a, b);
+  if (type === 'number' || type === 'bool') return a - b;
+  return String(a).localeCompare(String(b));
+}
+
+document.querySelectorAll('th[data-field]').forEach(th => {
+  th.addEventListener('click', () => {
+    const field = th.dataset.field;
+    sortState.dir = (sortState.field === field) ? sortState.dir * -1 : 1;
+    sortState.field = field;
+    document.querySelectorAll('th[data-field]').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+    th.classList.add(sortState.dir === 1 ? 'sort-asc' : 'sort-desc');
+    renderDeviceRows();
+  });
+});
 
 function renderDeviceRows() {
   const search = document.getElementById('filter-search').value.trim().toLowerCase();
@@ -637,6 +691,14 @@ function renderDeviceRows() {
     }
     return true;
   });
+
+  if (sortState.field) {
+    const th = document.querySelector('th[data-field="' + sortState.field + '"]');
+    const type = th ? th.dataset.type : 'string';
+    filtered.sort((a, b) => sortState.dir * compareValues(
+      sortFieldValue(a, sortState.field), sortFieldValue(b, sortState.field), type
+    ));
+  }
 
   document.getElementById('filter-count').textContent =
     filtered.length === lastDevices.length
