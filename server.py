@@ -8,6 +8,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -256,6 +257,42 @@ def trigger_speedtest():
     return {"ok": True}
 
 
+IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def ping_host(ip):
+    """On-demand ping for a single IP, triggered from the table. Argument
+    list form of subprocess.run (no shell=True) means the ip value can't
+    inject extra shell commands, but we still validate the format so a
+    bogus value fails fast with a clear error instead of a confusing
+    'unknown host' from ping itself."""
+    if not ip or not IP_RE.match(ip):
+        return {"ok": False, "error": "invalid IP address"}
+    try:
+        out = subprocess.run(
+            ["ping", "-c", "3", "-W", "2", ip],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+        m = re.search(r"(\d+) packets transmitted, (\d+) received", out)
+        if not m:
+            return {"ok": False, "error": "could not parse ping output"}
+        sent, received = int(m.group(1)), int(m.group(2))
+        result = {
+            "ok": True, "ip": ip, "sent": sent, "received": received,
+            "loss_pct": round(100 * (sent - received) / sent) if sent else 100,
+        }
+        rtt = re.search(r"= ([\d.]+)/([\d.]+)/([\d.]+)/[\d.]+ ms", out)
+        if rtt:
+            result.update({
+                "min_ms": float(rtt.group(1)),
+                "avg_ms": float(rtt.group(2)),
+                "max_ms": float(rtt.group(3)),
+            })
+        return result
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def get_self_vitals():
     self_id = get_self_identity()
     wifi = get_self_wifi()
@@ -478,6 +515,15 @@ DASHBOARD_HTML = """<!doctype html>
   }
   .scan-btn:hover { background: var(--row-hover); }
   .scan-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .ping-btn {
+    font-size: .7rem; font-weight: 600; padding: .2rem .55rem; min-width: 3.6rem;
+    border-radius: 6px; border: 1px solid var(--card-border); background: transparent;
+    color: var(--label); cursor: pointer;
+  }
+  .ping-btn:hover { background: var(--row-hover); color: var(--fg); }
+  .ping-btn:disabled { cursor: wait; opacity: .6; }
+  .ping-btn.ping-ok { border-color: var(--pill-ok-fg); color: var(--pill-ok-fg); }
+  .ping-btn.ping-bad { border-color: var(--pill-bad-fg); color: var(--pill-bad-fg); }
   .filter-bar { display: flex; align-items: center; gap: .6rem; margin-bottom: .6rem; flex-wrap: wrap; }
   .filter-search, .filter-select {
     font-size: .8rem; padding: .4rem .6rem; border-radius: 8px;
@@ -614,6 +660,7 @@ DASHBOARD_HTML = """<!doctype html>
           <th data-field="ports" data-type="number">Open Ports</th>
           <th data-field="first_seen" data-type="string">First Seen</th>
           <th data-field="last_seen" data-type="string">Last Seen</th>
+          <th>Ping</th>
         </tr>
       </thead>
       <tbody id="device-rows"></tbody>
@@ -629,6 +676,46 @@ function formatDuration(seconds) {
   if (m < 60) return m + 'm ' + s + 's';
   const h = Math.floor(m / 60);
   return h + 'h ' + (m % 60) + 'm';
+}
+
+// The device table fully rebuilds every 5s on auto-refresh, which would
+// otherwise wipe out an in-flight or just-finished ping's result before
+// it's even seen. Keyed cache + expiry survives across rebuilds instead
+// of holding state on a specific (soon to be discarded) button element.
+let pingResults = {};
+
+function pingButtonHtml(ip) {
+  const pr = pingResults[ip];
+  const loading = pr && pr.text === '…';
+  if (pr && (loading || pr.expiresAt > Date.now())) {
+    return '<button class="' + pr.className + '"' + (loading ? ' disabled' : '') +
+      ' onclick="pingIp(\\'' + ip + '\\')">' + pr.text + '</button>';
+  }
+  return '<button class="ping-btn" onclick="pingIp(\\'' + ip + '\\')">Ping</button>';
+}
+
+async function pingIp(ip) {
+  pingResults[ip] = { text: '…', className: 'ping-btn' };
+  renderDeviceRows();
+  try {
+    const res = await fetch('/ping?ip=' + encodeURIComponent(ip), { method: 'POST' });
+    const result = await res.json();
+    if (result.ok && result.received > 0) {
+      pingResults[ip] = {
+        text: result.avg_ms != null ? result.avg_ms.toFixed(1) + ' ms' : (result.received + '/' + result.sent),
+        className: 'ping-btn ping-ok', expiresAt: Date.now() + 8000,
+      };
+    } else {
+      pingResults[ip] = {
+        text: result.received === 0 ? 'timeout' : (result.error || 'failed'),
+        className: 'ping-btn ping-bad', expiresAt: Date.now() + 8000,
+      };
+    }
+  } catch (e) {
+    pingResults[ip] = { text: 'error', className: 'ping-btn ping-bad', expiresAt: Date.now() + 8000 };
+  }
+  renderDeviceRows();
+  setTimeout(renderDeviceRows, 8100);
 }
 
 let lastDevices = [];
@@ -734,7 +821,8 @@ function renderDeviceRows() {
       '<td>' + (dev.latency_ms != null ? dev.latency_ms + ' ms' : '—') + '</td>' +
       '<td>' + ports + '</td>' +
       '<td>' + (dev.first_seen || '—') + '</td>' +
-      '<td>' + (dev.last_seen || '—') + '</td>';
+      '<td>' + (dev.last_seen || '—') + '</td>' +
+      '<td>' + (dev.ip ? pingButtonHtml(dev.ip) : '—') + '</td>';
     rows.appendChild(tr);
   }
 }
@@ -962,10 +1050,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path == "/scan":
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/scan":
             result = trigger_scan()
-        elif self.path == "/speedtest":
+        elif parsed.path == "/speedtest":
             result = trigger_speedtest()
+        elif parsed.path == "/ping":
+            ip = urllib.parse.parse_qs(parsed.query).get("ip", [None])[0]
+            result = ping_host(ip)
         else:
             self.send_response(404)
             self.end_headers()
