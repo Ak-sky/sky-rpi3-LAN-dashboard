@@ -188,7 +188,7 @@ def internet_check_loop():
     global _internet_state, _last_down_epoch
     while True:
         result = check_internet()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
         now_epoch = time.time()
         with _lock:
             prev_up = _internet_state.get("up")
@@ -232,7 +232,7 @@ def run_speedtest():
         up = re.search(r"Upload:\s*([\d.]+)", out)
         with _lock:
             _speedtest_state.update({
-                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                 "ping_ms": float(ping.group(1)) if ping else None,
                 "download_mbps": float(down.group(1)) if down else None,
                 "upload_mbps": float(up.group(1)) if up else None,
@@ -241,7 +241,7 @@ def run_speedtest():
     except Exception as e:
         with _lock:
             _speedtest_state.update({
-                "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                 "error": str(e),
             })
     finally:
@@ -318,7 +318,7 @@ def get_self_vitals():
         "voltage": get_self_voltage(),
         "throttled": get_self_throttled(),
         "uptime": get_self_uptime(),
-        "clock": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "clock": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "public_ip": get_public_ip(),
     }
 
@@ -390,7 +390,7 @@ def run_scan():
         ).stdout
         devices = parse_nmap_output(out, get_self_identity())
         _last_scan.update({
-            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             "at_epoch": time.time(),
             "duration_s": round(time.time() - start, 1),
             "hosts_up": len(devices),
@@ -399,7 +399,7 @@ def run_scan():
         return devices
     except Exception as e:
         _last_scan.update({
-            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             "at_epoch": time.time(),
             "duration_s": round(time.time() - start, 1),
             "hosts_up": None,
@@ -430,7 +430,7 @@ def update_db(scanned_devices):
     (RE305) answers ARP for several IPs under one MAC, and keying by MAC
     collapsed those into a single overwritten row -- exactly the kind of
     wrong-IP bug this dashboard exists to avoid."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     seen_keys = set()
     with _lock:
         for d in scanned_devices:
