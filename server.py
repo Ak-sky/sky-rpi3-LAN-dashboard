@@ -257,6 +257,18 @@ def trigger_speedtest():
     return {"ok": True}
 
 
+def trigger_reboot():
+    """Reboots this Pi. Fires 1s after responding so the HTTP response
+    actually reaches the browser before the box goes down -- calling
+    `sudo reboot` synchronously in the request handler would kill the
+    process mid-write."""
+    def _do_reboot():
+        time.sleep(1)
+        subprocess.run(["sudo", "reboot"])
+    threading.Thread(target=_do_reboot, daemon=True).start()
+    return {"ok": True}
+
+
 IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 
 
@@ -524,6 +536,12 @@ DASHBOARD_HTML = """<!doctype html>
   .ping-btn:disabled { cursor: wait; opacity: .6; }
   .ping-btn.ping-ok { border-color: var(--pill-ok-fg); color: var(--pill-ok-fg); }
   .ping-btn.ping-bad { border-color: var(--pill-bad-fg); color: var(--pill-bad-fg); }
+  .reboot-btn {
+    margin-left: auto; font-size: .78rem; font-weight: 600; padding: .4rem .9rem;
+    border-radius: 8px; border: 1px solid var(--pill-bad-fg); background: var(--pill-bad-bg);
+    color: var(--pill-bad-fg); cursor: pointer;
+  }
+  .reboot-btn:disabled { opacity: .5; cursor: not-allowed; }
   .filter-bar { display: flex; align-items: center; gap: .6rem; margin-bottom: .6rem; flex-wrap: wrap; }
   .filter-search, .filter-select {
     font-size: .8rem; padding: .4rem .6rem; border-radius: 8px;
@@ -610,6 +628,7 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="vmetric"><span class="label">Under-voltage</span><span class="value" id="self-uv">&mdash;</span></div>
   <div class="vmetric"><span class="label">Uptime</span><span class="value" id="self-uptime">&mdash;</span></div>
   <div class="vmetric"><span class="label">Clock</span><span class="value" id="self-clock">&mdash;</span></div>
+  <button id="reboot-btn" class="reboot-btn">Reboot Pi</button>
 </div>
 
 <div class="table-card" style="flex: 0 0 auto; max-height: 11rem;">
@@ -993,6 +1012,31 @@ document.getElementById('speedtest-btn').addEventListener('click', async () => {
   refresh();
 });
 
+document.getElementById('reboot-btn').addEventListener('click', async () => {
+  const hostname = document.getElementById('page-hostname').textContent;
+  if (!confirm('Reboot ' + hostname + ' now?\\n\\nThe dashboard will be unreachable for about a minute while it restarts.')) return;
+  const btn = document.getElementById('reboot-btn');
+  btn.disabled = true;
+  btn.textContent = 'Rebooting…';
+  try {
+    await fetch('/reboot', { method: 'POST' });
+  } catch (e) {
+    // expected -- the connection drops as the box goes down
+  }
+  document.getElementById('status-bar').textContent = 'Reboot triggered -- waiting for ' + hostname + ' to come back online…';
+  const waitForReboot = setInterval(async () => {
+    try {
+      const r = await fetch('/devices');
+      if (r.ok) {
+        clearInterval(waitForReboot);
+        location.reload();
+      }
+    } catch (e) {
+      // still down, keep waiting
+    }
+  }, 3000);
+});
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -1058,6 +1102,8 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/ping":
             ip = urllib.parse.parse_qs(parsed.query).get("ip", [None])[0]
             result = ping_host(ip)
+        elif parsed.path == "/reboot":
+            result = trigger_reboot()
         else:
             self.send_response(404)
             self.end_headers()
