@@ -635,9 +635,15 @@ let lastDevices = [];
 let sortState = { field: null, dir: 1 };
 
 function deviceLinkKind(dev) {
+  // Identify the extender's own row by hostname alone, not by also requiring
+  // the shared-MAC heuristic to agree -- this Pi's WiFi keeps roaming (see
+  // dmesg cfg80211 warnings), and the MAC ARP reports for the extender's own
+  // management IP has been observed to shift across scans and not match the
+  // extender's real hardware MAC at all. Hostname via mDNS is the stable signal.
   const isExtenderHost = dev.hostname && dev.hostname.toUpperCase().includes('RE305');
-  if (dev.link !== 'via_extender') return 'direct';
-  return isExtenderHost ? 'extender' : 'via_extender';
+  if (isExtenderHost) return 'extender';
+  if (dev.link === 'via_extender') return 'via_extender';
+  return 'direct';
 }
 
 function sortFieldValue(dev, field) {
@@ -753,7 +759,13 @@ async function refresh() {
     let extenderOnline = null, extenderLatency = null, behindExtender = 0;
     for (const dev of devices) {
       const linkKind = deviceLinkKind(dev);
-      if (linkKind === 'extender') { extenderOnline = dev.online; extenderLatency = dev.latency_ms; }
+      // Multiple devices can carry the extender's hostname over time (e.g. it
+      // moved IPs and a stale offline record lingers) -- once we've locked
+      // onto an online match, don't let a stale offline one clobber it.
+      if (linkKind === 'extender' && (extenderOnline === null || dev.online)) {
+        extenderOnline = dev.online;
+        extenderLatency = dev.latency_ms;
+      }
       if (linkKind === 'via_extender') behindExtender++;
     }
 
