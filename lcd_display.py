@@ -55,7 +55,7 @@ def get_local_ip():
 
 
 USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
-_usage_cache = {"result": None, "next_allowed_fetch": 0}
+_usage_cache = {"result": None, "next_allowed_fetch": 0, "last_success_at": None}
 
 
 def _load_usage_cache():
@@ -64,12 +64,13 @@ def _load_usage_cache():
     call -- an in-memory-only cache defeats the whole point of backing off
     on repeated restarts, which is exactly what happened during iterative
     deploys."""
-    global _usage_cache
     try:
         with open(USAGE_CACHE_PATH) as f:
             loaded = json.load(f)
         if isinstance(loaded, dict) and "next_allowed_fetch" in loaded:
-            _usage_cache = loaded
+            _usage_cache.update(loaded)  # merge, not replace -- a persisted
+            # file from before a schema change (like adding last_success_at)
+            # must not wipe out keys the current code expects to exist
     except Exception:
         pass
 
@@ -127,7 +128,11 @@ def get_usage():
     if now >= _usage_cache["next_allowed_fetch"]:
         result, wait = _fetch_usage()
         _usage_cache["next_allowed_fetch"] = now + wait
-        if result["ok"] or _usage_cache["result"] is None:
+        if result["ok"]:
+            _usage_cache["result"] = result
+            _usage_cache["last_success_at"] = now
+        elif _usage_cache["result"] is None:
+            # No previous good result to fall back on -- show the error.
             _usage_cache["result"] = result
         else:
             # Fetch failed but we have a previous good result -- keep showing
@@ -135,6 +140,22 @@ def get_usage():
             pass
         _save_usage_cache()
     return _usage_cache["result"]
+
+
+def get_usage_data_age_str():
+    """How long ago the currently-displayed usage numbers were actually
+    fetched -- distinct from when the screen itself last redrew, which can
+    be much more recent than the underlying data during a rate-limit
+    backoff. Showing frame-redraw time alone made stale data look fresh."""
+    last = _usage_cache["last_success_at"]
+    if last is None:
+        return "never"
+    age_s = int(time.time() - last)
+    if age_s < 60:
+        return f"{age_s}s ago"
+    if age_s < 3600:
+        return f"{age_s // 60}m ago"
+    return f"{age_s // 3600}h {(age_s % 3600) // 60}m ago"
 
 
 def _generate_tone_wav(path, freq_hz, duration_ms, volume=0.95, sample_rate=22050):
@@ -307,8 +328,7 @@ def render_frame(ip, hostname, usage_result):
         draw.text((20, 130), "Claude usage unavailable", font=font_label, fill=(235, 90, 90))
         draw.text((20, 155), usage_result["error"], font=font_small, fill=DIM)
 
-    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    draw.text((20, HEIGHT - 26), "updated " + now_str, font=font_small, fill=DIM)
+    draw.text((20, HEIGHT - 26), "usage data: " + get_usage_data_age_str(), font=font_small, fill=DIM)
 
     return img
 
