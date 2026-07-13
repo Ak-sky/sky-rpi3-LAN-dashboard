@@ -34,6 +34,7 @@ font_title = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 22)
 font_pct = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 40)
 font_label = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 16)
 font_small = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 14)
+font_clock = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 28)
 
 BG = (18, 18, 18)
 FG = (235, 235, 235)
@@ -300,6 +301,15 @@ def render_frame(ip, hostname, usage_result):
 
     draw.text((20, 14), hostname, font=font_title, fill=FG)
     draw.text((20, 42), "IP " + ip, font=font_label, fill=DIM)
+
+    # Digital clock, top-right. No seconds: the screen only redraws every
+    # FRAME_INTERVAL (15s), so a seconds display would visibly stutter
+    # rather than tick smoothly.
+    clock_str = datetime.now().strftime("%H:%M")
+    bbox = draw.textbbox((0, 0), clock_str, font=font_clock)
+    clock_w = bbox[2] - bbox[0]
+    draw.text((WIDTH - 20 - clock_w, 10), clock_str, font=font_clock, fill=FG)
+
     draw.line([(20, 68), (WIDTH - 20, 68)], fill=BAR_BG, width=1)
 
     if usage_result["ok"]:
