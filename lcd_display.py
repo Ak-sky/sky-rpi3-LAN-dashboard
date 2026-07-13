@@ -215,6 +215,19 @@ def format_reset(iso_str):
         return "?"
 
 
+def format_reset_absolute(iso_str):
+    """The actual clock time a window resets at (local time), alongside the
+    relative countdown from format_reset() -- e.g. "4h 48m" + "20:00"."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone()
+        now_local = datetime.now().astimezone()
+        if dt.date() == now_local.date():
+            return dt.strftime("%H:%M")
+        return dt.strftime("%a %H:%M")
+    except Exception:
+        return "?"
+
+
 def color_for_pct(pct):
     if pct is None:
         return DIM
@@ -225,7 +238,7 @@ def color_for_pct(pct):
     return (235, 90, 90)
 
 
-def draw_meter(draw, y, label, pct, reset_str):
+def draw_meter(draw, y, label, pct, reset_str, reset_at_str):
     color = color_for_pct(pct)
     draw.text((20, y), label, font=font_label, fill=DIM)
     pct_text = f"{pct:.0f}%" if pct is not None else "--"
@@ -238,8 +251,9 @@ def draw_meter(draw, y, label, pct, reset_str):
         if fill_w > 0:
             draw.rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], fill=color)
 
-    reset_text = f"Resets in {reset_str}" if reset_str else ""
-    draw.text((150, y + 58), reset_text, font=font_small, fill=DIM)
+    if reset_str:
+        draw.text((150, y + 58), f"Resets in {reset_str}", font=font_small, fill=DIM)
+        draw.text((150, y + 76), f"({reset_at_str})", font=font_small, fill=DIM)
 
 
 def render_frame(ip, hostname, usage_result):
@@ -254,8 +268,12 @@ def render_frame(ip, hostname, usage_result):
         data = usage_result["data"]
         five_hour = data.get("five_hour") or {}
         seven_day = data.get("seven_day") or {}
-        draw_meter(draw, 90, "SESSION (5 HOUR)", five_hour.get("utilization"), format_reset(five_hour.get("resets_at")))
-        draw_meter(draw, 190, "WEEKLY", seven_day.get("utilization"), format_reset(seven_day.get("resets_at")))
+        session_resets_at = five_hour.get("resets_at")
+        weekly_resets_at = seven_day.get("resets_at")
+        draw_meter(draw, 90, "SESSION (5 HOUR)", five_hour.get("utilization"),
+                   format_reset(session_resets_at), format_reset_absolute(session_resets_at))
+        draw_meter(draw, 195, "WEEKLY", seven_day.get("utilization"),
+                   format_reset(weekly_resets_at), format_reset_absolute(weekly_resets_at))
     else:
         draw.text((20, 130), "Claude usage unavailable", font=font_label, fill=(235, 90, 90))
         draw.text((20, 155), usage_result["error"], font=font_small, fill=DIM)
