@@ -97,7 +97,7 @@ def get_usage():
     return _usage_cache["result"]
 
 
-def _generate_tone_wav(path, freq_hz, duration_ms, volume=0.5, sample_rate=22050):
+def _generate_tone_wav(path, freq_hz, duration_ms, volume=0.95, sample_rate=22050):
     """Simple sine tone with a short fade in/out (avoids a click at the
     edges), written as a stdlib wave file -- no sound assets to source
     or commit, the script is self-contained."""
@@ -121,10 +121,11 @@ def _generate_tone_wav(path, freq_hz, duration_ms, volume=0.5, sample_rate=22050
 
 
 def ensure_beep_files():
-    if not os.path.exists(BEEP_SHORT_WAV):
-        _generate_tone_wav(BEEP_SHORT_WAV, freq_hz=1200, duration_ms=150)
-    if not os.path.exists(BEEP_LONG_WAV):
-        _generate_tone_wav(BEEP_LONG_WAV, freq_hz=500, duration_ms=900)
+    # Regenerate unconditionally -- earlier files were at 50% amplitude and
+    # too quiet to hear (confirmed by reading back the raw samples), so a
+    # stale existing-file check would keep the quiet version around forever.
+    _generate_tone_wav(BEEP_SHORT_WAV, freq_hz=1200, duration_ms=250)
+    _generate_tone_wav(BEEP_LONG_WAV, freq_hz=500, duration_ms=1000)
 
 
 def _play_wav(path):
@@ -134,21 +135,49 @@ def _play_wav(path):
         pass
 
 
+def flash_screen(color, text, pulses=2, on_ms=350, off_ms=180):
+    """Briefly pulses a solid color + centered message on the LCD, then lets
+    the normal render loop resume on its next cycle. Runs synchronously
+    (blocks the render loop for ~1s) -- acceptable since this only fires on
+    genuinely rare events, not every frame."""
+    is_light = sum(color) > 380
+    text_color = (20, 20, 20) if is_light else (245, 245, 245)
+    for i in range(pulses):
+        img = Image.new("RGB", (WIDTH, HEIGHT), color)
+        draw = ImageDraw.Draw(img)
+        bbox = draw.textbbox((0, 0), text, font=font_title)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((WIDTH - tw) // 2, (HEIGHT - th) // 2), text, font=font_title, fill=text_color)
+        try:
+            write_to_fb(img)
+        except Exception:
+            pass
+        time.sleep(on_ms / 1000)
+        if i < pulses - 1:
+            try:
+                write_to_fb(Image.new("RGB", (WIDTH, HEIGHT), BG))
+            except Exception:
+                pass
+            time.sleep(off_ms / 1000)
+
+
 _session_state = {"last_milestone": None, "last_resets_at": None}
 
 
 def check_session_events(five_hour):
-    """Short beep each time session usage crosses a new 5% milestone; long
-    beep when the session window itself rolls over (detected via resets_at
-    changing to a new value). First observation after a service (re)start
-    just establishes a baseline rather than firing a beep storm for
-    whatever level usage already happens to be at."""
+    """Short beep + flash each time session usage crosses a new 5%
+    milestone; long beep + flash when the session window itself rolls over
+    (detected via resets_at changing to a new value). First observation
+    after a service (re)start just establishes a baseline rather than
+    firing a notification storm for whatever level usage already happens
+    to be at."""
     pct = five_hour.get("utilization")
     resets_at = five_hour.get("resets_at")
     if pct is None:
         return
 
     current_milestone = int(pct // MILESTONE_STEP) * MILESTONE_STEP
+    reset_str = format_reset(resets_at) if resets_at else "?"
 
     if _session_state["last_resets_at"] is None:
         _session_state["last_resets_at"] = resets_at
@@ -157,12 +186,14 @@ def check_session_events(five_hour):
 
     if resets_at and resets_at != _session_state["last_resets_at"]:
         _play_wav(BEEP_LONG_WAV)
+        flash_screen((90, 140, 235), f"Session reset — next in {reset_str}")
         _session_state["last_resets_at"] = resets_at
         _session_state["last_milestone"] = current_milestone
         return
 
     if _session_state["last_milestone"] is not None and current_milestone > _session_state["last_milestone"]:
         _play_wav(BEEP_SHORT_WAV)
+        flash_screen(color_for_pct(pct), f"{current_milestone}% used — resets in {reset_str}")
     _session_state["last_milestone"] = current_milestone
 
 
