@@ -295,6 +295,23 @@ def draw_meter(draw, y, label, pct, reset_str, reset_at_str):
         draw.text((150, y + 58), f"Resets in {reset_str}, {reset_at_str}", font=font_small, fill=DIM)
 
 
+# Fixed box the clock always renders into -- big enough for "23:59:59" with
+# padding. Sized generously so the digit-width variance of a proportional
+# (non-monospace) font never leaves a stale pixel behind between ticks.
+CLOCK_BOX = (270, 8, 190, 40)  # x, y, w, h
+
+
+def render_clock_region():
+    x, y, w, h = CLOCK_BOX
+    img = Image.new("RGB", (w, h), BG)
+    draw = ImageDraw.Draw(img)
+    clock_str = datetime.now().strftime("%H:%M:%S")
+    bbox = draw.textbbox((0, 0), clock_str, font=font_clock)
+    tw = bbox[2] - bbox[0]
+    draw.text((w - tw - 6, 4), clock_str, font=font_clock, fill=FG)
+    return img
+
+
 def render_frame(ip, hostname, usage_result):
     img = Image.new("RGB", (WIDTH, HEIGHT), BG)
     draw = ImageDraw.Draw(img)
@@ -302,13 +319,7 @@ def render_frame(ip, hostname, usage_result):
     draw.text((20, 14), hostname, font=font_title, fill=FG)
     draw.text((20, 42), "IP " + ip, font=font_label, fill=DIM)
 
-    # Digital clock, top-right. No seconds: the screen only redraws every
-    # FRAME_INTERVAL (15s), so a seconds display would visibly stutter
-    # rather than tick smoothly.
-    clock_str = datetime.now().strftime("%H:%M")
-    bbox = draw.textbbox((0, 0), clock_str, font=font_clock)
-    clock_w = bbox[2] - bbox[0]
-    draw.text((WIDTH - 20 - clock_w, 10), clock_str, font=font_clock, fill=FG)
+    img.paste(render_clock_region(), (CLOCK_BOX[0], CLOCK_BOX[1]))
 
     draw.line([(20, 68), (WIDTH - 20, 68)], fill=BAR_BG, width=1)
 
@@ -342,22 +353,51 @@ def write_to_fb(img):
         f.write(rgb565.astype("<u2").tobytes())
 
 
+FB_STRIDE = WIDTH * 2  # bytes/row (matches `fbset`'s LineLength=960 for 480px @ 16bpp)
+
+
+def write_region_to_fb(img, x0, y0):
+    """Partial write -- only touches the rows/columns img covers, instead of
+    rewriting the full 307KB frame. Used for the per-second clock tick so
+    ticking every second doesn't mean a full redraw every second."""
+    arr = np.asarray(img, dtype=np.uint8)
+    h = arr.shape[0]
+    r = (arr[:, :, 0] >> 3).astype(np.uint16)
+    g = (arr[:, :, 1] >> 2).astype(np.uint16)
+    b = (arr[:, :, 2] >> 3).astype(np.uint16)
+    rgb565 = ((r << 11) | (g << 5) | b).astype("<u2")
+    with open(FB_DEVICE, "r+b") as f:
+        for row in range(h):
+            f.seek((y0 + row) * FB_STRIDE + x0 * 2)
+            f.write(rgb565[row].tobytes())
+
+
 def main():
     ensure_beep_files()
     _load_usage_cache()
     hostname = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
+    next_full_redraw = 0
     while True:
-        ip = get_local_ip()
-        usage_result = get_usage()
-        if usage_result["ok"]:
-            five_hour = usage_result["data"].get("five_hour") or {}
-            check_session_events(five_hour)
-        img = render_frame(ip, hostname, usage_result)
-        try:
-            write_to_fb(img)
-        except Exception:
-            pass  # framebuffer write failing shouldn't crash the refresh loop
-        time.sleep(FRAME_INTERVAL)
+        now = time.time()
+        if now >= next_full_redraw:
+            ip = get_local_ip()
+            usage_result = get_usage()
+            if usage_result["ok"]:
+                five_hour = usage_result["data"].get("five_hour") or {}
+                check_session_events(five_hour)
+            img = render_frame(ip, hostname, usage_result)
+            try:
+                write_to_fb(img)
+            except Exception:
+                pass  # framebuffer write failing shouldn't crash the refresh loop
+            next_full_redraw = now + FRAME_INTERVAL
+        else:
+            # Cheap per-second tick: just the clock digits, not a full redraw.
+            try:
+                write_region_to_fb(render_clock_region(), CLOCK_BOX[0], CLOCK_BOX[1])
+            except Exception:
+                pass
+        time.sleep(1)
 
 
 if __name__ == "__main__":
