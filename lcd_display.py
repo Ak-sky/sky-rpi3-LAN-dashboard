@@ -252,8 +252,7 @@ def draw_meter(draw, y, label, pct, reset_str, reset_at_str):
             draw.rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], fill=color)
 
     if reset_str:
-        draw.text((150, y + 58), f"Resets in {reset_str}", font=font_small, fill=DIM)
-        draw.text((150, y + 76), f"({reset_at_str})", font=font_small, fill=DIM)
+        draw.text((150, y + 58), f"Resets in {reset_str}, {reset_at_str}", font=font_small, fill=DIM)
 
 
 def render_frame(ip, hostname, usage_result):
