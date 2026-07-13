@@ -16,7 +16,9 @@ from PIL import Image, ImageDraw, ImageFont
 CREDS_PATH = "/home/pi/.claude_oauth_credentials.json"
 FB_DEVICE = "/dev/fb1"
 WIDTH, HEIGHT = 480, 320
-REFRESH_INTERVAL = 60  # seconds
+FRAME_INTERVAL = 15       # seconds; cheap redraw (clock/IP) using cached usage
+USAGE_POLL_INTERVAL = 120  # seconds; the actual rate-limited API call
+USAGE_BACKOFF_DEFAULT = 300  # seconds; fallback wait on 429 if no Retry-After given -- deliberately more conservative than the normal poll interval, so an actual rate-limit hit doesn't get retried at the same aggressive cadence that caused it
 WIFI_IFACE = "wlan0"
 
 FONT_DIR = "/usr/share/fonts/truetype/dejavu"
@@ -43,7 +45,10 @@ def get_local_ip():
         return "no IP"
 
 
-def get_usage():
+_usage_cache = {"result": None, "next_allowed_fetch": 0}
+
+
+def _fetch_usage():
     try:
         with open(CREDS_PATH) as f:
             token = json.load(f)["claudeAiOauth"]["accessToken"]
@@ -52,11 +57,36 @@ def get_usage():
             headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return {"ok": True, "data": json.loads(resp.read())}
+            return {"ok": True, "data": json.loads(resp.read())}, USAGE_POLL_INTERVAL
     except urllib.error.HTTPError as e:
-        return {"ok": False, "error": f"HTTP {e.code}"}
+        if e.code == 429:
+            retry_after = e.headers.get("Retry-After")
+            try:
+                wait = int(retry_after) if retry_after else USAGE_BACKOFF_DEFAULT
+            except ValueError:
+                wait = USAGE_BACKOFF_DEFAULT
+            return {"ok": False, "error": "HTTP 429 (rate limited)"}, wait
+        return {"ok": False, "error": f"HTTP {e.code}"}, USAGE_POLL_INTERVAL
     except Exception as e:
-        return {"ok": False, "error": str(e)[:60]}
+        return {"ok": False, "error": str(e)[:60]}, 30  # transient (network etc), retry soon
+
+
+def get_usage():
+    """Cached: only actually calls the API every USAGE_POLL_INTERVAL (longer
+    still after a 429, respecting Retry-After) -- this endpoint doesn't need
+    to be polled every render frame, and polling it that aggressively is
+    exactly what caused the 429s in the first place."""
+    now = time.time()
+    if now >= _usage_cache["next_allowed_fetch"]:
+        result, wait = _fetch_usage()
+        _usage_cache["next_allowed_fetch"] = now + wait
+        if result["ok"] or _usage_cache["result"] is None:
+            _usage_cache["result"] = result
+        else:
+            # Fetch failed but we have a previous good result -- keep showing
+            # it rather than replacing a working display with an error.
+            pass
+    return _usage_cache["result"]
 
 
 def format_reset(iso_str):
@@ -148,7 +178,7 @@ def main():
             write_to_fb(img)
         except Exception:
             pass  # framebuffer write failing shouldn't crash the refresh loop
-        time.sleep(REFRESH_INTERVAL)
+        time.sleep(FRAME_INTERVAL)
 
 
 if __name__ == "__main__":
