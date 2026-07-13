@@ -53,7 +53,34 @@ def get_local_ip():
         return "no IP"
 
 
+USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
 _usage_cache = {"result": None, "next_allowed_fetch": 0}
+
+
+def _load_usage_cache():
+    """Persisted to disk so a service restart (crash, redeploy, reboot)
+    doesn't reset next_allowed_fetch to 0 and immediately fire a fresh API
+    call -- an in-memory-only cache defeats the whole point of backing off
+    on repeated restarts, which is exactly what happened during iterative
+    deploys."""
+    global _usage_cache
+    try:
+        with open(USAGE_CACHE_PATH) as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict) and "next_allowed_fetch" in loaded:
+            _usage_cache = loaded
+    except Exception:
+        pass
+
+
+def _save_usage_cache():
+    try:
+        tmp = USAGE_CACHE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_usage_cache, f)
+        os.replace(tmp, USAGE_CACHE_PATH)
+    except Exception:
+        pass
 
 
 def _fetch_usage():
@@ -94,6 +121,7 @@ def get_usage():
             # Fetch failed but we have a previous good result -- keep showing
             # it rather than replacing a working display with an error.
             pass
+        _save_usage_cache()
     return _usage_cache["result"]
 
 
@@ -295,6 +323,7 @@ def write_to_fb(img):
 
 def main():
     ensure_beep_files()
+    _load_usage_cache()
     hostname = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
     while True:
         ip = get_local_ip()
