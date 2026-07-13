@@ -1,0 +1,13 @@
+[Unit]
+Description=Claude usage + IP display on the SPI TFT (fb1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/lcd_display.py
+Restart=always
+RestartSec=5
+User=pi
+
+[Install]
+WantedBy=multi-user.target
