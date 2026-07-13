@@ -3,11 +3,15 @@
 480x320 RGB565. Runs standalone -- takes over fb1 exclusively, so fbcp
 must not be running (it would fight over the same framebuffer)."""
 import json
+import math
+import os
 import re
+import struct
 import subprocess
 import time
 import urllib.error
 import urllib.request
+import wave
 from datetime import datetime, timezone
 
 import numpy as np
@@ -20,6 +24,10 @@ FRAME_INTERVAL = 15       # seconds; cheap redraw (clock/IP) using cached usage
 USAGE_POLL_INTERVAL = 120  # seconds; the actual rate-limited API call
 USAGE_BACKOFF_DEFAULT = 300  # seconds; fallback wait on 429 if no Retry-After given -- deliberately more conservative than the normal poll interval, so an actual rate-limit hit doesn't get retried at the same aggressive cadence that caused it
 WIFI_IFACE = "wlan0"
+
+BEEP_SHORT_WAV = "/home/pi/beep_short.wav"
+BEEP_LONG_WAV = "/home/pi/beep_long.wav"
+MILESTONE_STEP = 5  # percent
 
 FONT_DIR = "/usr/share/fonts/truetype/dejavu"
 font_title = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 22)
@@ -87,6 +95,75 @@ def get_usage():
             # it rather than replacing a working display with an error.
             pass
     return _usage_cache["result"]
+
+
+def _generate_tone_wav(path, freq_hz, duration_ms, volume=0.5, sample_rate=22050):
+    """Simple sine tone with a short fade in/out (avoids a click at the
+    edges), written as a stdlib wave file -- no sound assets to source
+    or commit, the script is self-contained."""
+    n_samples = int(sample_rate * duration_ms / 1000)
+    fade_samples = min(200, n_samples // 4)
+    samples = []
+    for i in range(n_samples):
+        t = i / sample_rate
+        amp = volume
+        if i < fade_samples:
+            amp *= i / fade_samples
+        elif i > n_samples - fade_samples:
+            amp *= (n_samples - i) / fade_samples
+        value = int(amp * 32767 * math.sin(2 * math.pi * freq_hz * t))
+        samples.append(struct.pack("<h", value))
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        f.writeframes(b"".join(samples))
+
+
+def ensure_beep_files():
+    if not os.path.exists(BEEP_SHORT_WAV):
+        _generate_tone_wav(BEEP_SHORT_WAV, freq_hz=1200, duration_ms=150)
+    if not os.path.exists(BEEP_LONG_WAV):
+        _generate_tone_wav(BEEP_LONG_WAV, freq_hz=500, duration_ms=900)
+
+
+def _play_wav(path):
+    try:
+        subprocess.Popen(["aplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+_session_state = {"last_milestone": None, "last_resets_at": None}
+
+
+def check_session_events(five_hour):
+    """Short beep each time session usage crosses a new 5% milestone; long
+    beep when the session window itself rolls over (detected via resets_at
+    changing to a new value). First observation after a service (re)start
+    just establishes a baseline rather than firing a beep storm for
+    whatever level usage already happens to be at."""
+    pct = five_hour.get("utilization")
+    resets_at = five_hour.get("resets_at")
+    if pct is None:
+        return
+
+    current_milestone = int(pct // MILESTONE_STEP) * MILESTONE_STEP
+
+    if _session_state["last_resets_at"] is None:
+        _session_state["last_resets_at"] = resets_at
+        _session_state["last_milestone"] = current_milestone
+        return
+
+    if resets_at and resets_at != _session_state["last_resets_at"]:
+        _play_wav(BEEP_LONG_WAV)
+        _session_state["last_resets_at"] = resets_at
+        _session_state["last_milestone"] = current_milestone
+        return
+
+    if _session_state["last_milestone"] is not None and current_milestone > _session_state["last_milestone"]:
+        _play_wav(BEEP_SHORT_WAV)
+    _session_state["last_milestone"] = current_milestone
 
 
 def format_reset(iso_str):
@@ -169,10 +246,14 @@ def write_to_fb(img):
 
 
 def main():
+    ensure_beep_files()
     hostname = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
     while True:
         ip = get_local_ip()
         usage_result = get_usage()
+        if usage_result["ok"]:
+            five_hour = usage_result["data"].get("five_hour") or {}
+            check_session_events(five_hour)
         img = render_frame(ip, hostname, usage_result)
         try:
             write_to_fb(img)
