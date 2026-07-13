@@ -8,7 +8,9 @@ import os
 import re
 import struct
 import subprocess
+import sys
 import time
+import traceback
 import urllib.error
 import urllib.request
 import wave
@@ -42,6 +44,14 @@ DIM = (150, 150, 150)
 BAR_BG = (50, 50, 50)
 
 
+def log_error(context):
+    """Prints to stderr so `journalctl -u lcd-display` shows it -- silent
+    `except: pass` blocks were the reason failures required manual SSH
+    digging instead of just reading the service log."""
+    print(f"[{datetime.now().isoformat()}] ERROR in {context}:", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+
+
 def get_local_ip():
     try:
         out = subprocess.run(
@@ -71,8 +81,10 @@ def _load_usage_cache():
             _usage_cache.update(loaded)  # merge, not replace -- a persisted
             # file from before a schema change (like adding last_success_at)
             # must not wipe out keys the current code expects to exist
+    except FileNotFoundError:
+        pass  # normal on first-ever boot, nothing to load yet
     except Exception:
-        pass
+        log_error("_load_usage_cache")
 
 
 def _save_usage_cache():
@@ -82,7 +94,7 @@ def _save_usage_cache():
             json.dump(_usage_cache, f)
         os.replace(tmp, USAGE_CACHE_PATH)
     except Exception:
-        pass
+        log_error("_save_usage_cache")
 
 
 def _get_bearer_token():
@@ -158,6 +170,24 @@ def get_usage_data_age_str():
     return f"{age_s // 3600}h {(age_s % 3600) // 60}m ago"
 
 
+PROCESS_START = time.time()
+STALE_WARN_SECONDS = 900  # 15 min -- well beyond the normal 2 min poll
+# interval plus 429 backoff, so this only fires on a genuine stuck state
+# (e.g. expired token) rather than routine rate-limit waiting.
+
+
+def is_data_stale():
+    """True once the displayed numbers are old enough that something is
+    actually wrong (expired token, persistent network failure), not just
+    mid-backoff. A "never fetched" state is only flagged once the process
+    has had a fair chance to succeed -- otherwise every boot would flash
+    a false alarm for the first couple minutes."""
+    last = _usage_cache["last_success_at"]
+    if last is None:
+        return (time.time() - PROCESS_START) > STALE_WARN_SECONDS
+    return (time.time() - last) > STALE_WARN_SECONDS
+
+
 def _generate_tone_wav(path, freq_hz, duration_ms, volume=0.95, sample_rate=22050):
     """Simple sine tone with a short fade in/out (avoids a click at the
     edges), written as a stdlib wave file -- no sound assets to source
@@ -193,7 +223,7 @@ def _play_wav(path):
     try:
         subprocess.Popen(["aplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
-        pass
+        log_error("_play_wav")
 
 
 _session_state = {"last_milestone": None, "last_resets_at": None}
@@ -314,6 +344,8 @@ def render_frame(ip, hostname, usage_result):
 
     draw.line([(20, 68), (WIDTH - 20, 68)], fill=BAR_BG, width=1)
 
+    stale = is_data_stale()
+
     if usage_result["ok"]:
         data = usage_result["data"]
         five_hour = data.get("five_hour") or {}
@@ -328,7 +360,18 @@ def render_frame(ip, hostname, usage_result):
         draw.text((20, 130), "Claude usage unavailable", font=font_label, fill=(235, 90, 90))
         draw.text((20, 155), usage_result["error"], font=font_small, fill=DIM)
 
-    draw.text((20, HEIGHT - 26), "usage data: " + get_usage_data_age_str(), font=font_small, fill=DIM)
+    if not usage_result["ok"] or stale:
+        # A dim gray footer line was easy to miss from across the room --
+        # this is the whole reason the 100%-stuck bug went unnoticed for as
+        # long as it did. A solid red banner is impossible to miss at a
+        # glance, which is the actual point of "don't make me debug again".
+        banner_h = 24
+        draw.rectangle([0, HEIGHT - banner_h, WIDTH, HEIGHT], fill=(180, 30, 30))
+        msg = "STALE DATA -- CHECK TOKEN" if stale else "USAGE FETCH FAILING"
+        draw.text((20, HEIGHT - banner_h + 4), f"{msg} ({get_usage_data_age_str()})",
+                   font=font_small, fill=(255, 255, 255))
+    else:
+        draw.text((20, HEIGHT - 26), "usage data: " + get_usage_data_age_str(), font=font_small, fill=DIM)
 
     return img
 
@@ -379,14 +422,18 @@ def main():
             try:
                 write_to_fb(img)
             except Exception:
-                pass  # framebuffer write failing shouldn't crash the refresh loop
+                # A framebuffer write failure shouldn't crash the refresh
+                # loop (the display might be mid-reinit, e.g. after a
+                # driver reload), but it must not vanish silently either --
+                # that's how this system spent a week failing invisibly.
+                log_error("write_to_fb")
             next_full_redraw = now + FRAME_INTERVAL
         else:
             # Cheap per-second tick: just the clock digits, not a full redraw.
             try:
                 write_region_to_fb(render_clock_region(), CLOCK_BOX[0], CLOCK_BOX[1])
             except Exception:
-                pass
+                log_error("write_region_to_fb")
         time.sleep(1)
 
 
