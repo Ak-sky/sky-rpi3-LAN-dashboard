@@ -83,10 +83,21 @@ def _save_usage_cache():
         pass
 
 
+def _get_bearer_token():
+    """Just reads the current token -- auto-refresh was tried (endpoint and
+    client_id verified against the official CLI binary) but the actual
+    POST got 403 Forbidden, meaning the real client does something in this
+    flow (extra headers, device attestation, PKCE context from the
+    original login, etc.) that isn't safely reverse-engineerable. Staying
+    fresh is handled externally instead: a launchd job on the Mac re-pushes
+    the Keychain-refreshed token to this file every 4 hours."""
+    with open(CREDS_PATH) as f:
+        return json.load(f)["claudeAiOauth"]["accessToken"]
+
+
 def _fetch_usage():
     try:
-        with open(CREDS_PATH) as f:
-            token = json.load(f)["claudeAiOauth"]["accessToken"]
+        token = _get_bearer_token()
         req = urllib.request.Request(
             "https://api.anthropic.com/api/oauth/usage",
             headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
