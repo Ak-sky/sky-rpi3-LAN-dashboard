@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-CREDS_PATH = "/home/pi/.claude_oauth_credentials.json"
+CREDS_PATH = "/home/pi/.claude/.credentials.json"
 FB_DEVICE = "/dev/fb1"
 WIDTH, HEIGHT = 480, 320
 FRAME_INTERVAL = 15       # seconds; cheap redraw (clock/IP) using cached usage
@@ -98,13 +98,14 @@ def _save_usage_cache():
 
 
 def _get_bearer_token():
-    """Just reads the current token -- auto-refresh was tried (endpoint and
-    client_id verified against the official CLI binary) but the actual
-    POST got 403 Forbidden, meaning the real client does something in this
-    flow (extra headers, device attestation, PKCE context from the
-    original login, etc.) that isn't safely reverse-engineerable. Staying
-    fresh is handled externally instead: a launchd job on the Mac re-pushes
-    the Keychain-refreshed token to this file every 4 hours."""
+    """Reads directly from Claude Code's own native credentials file on this
+    Pi (~/.claude/.credentials.json), kept fresh by the Pi's own logged-in
+    CLI session -- not copied from anywhere else. Implementing our own
+    refresh was tried and abandoned (endpoint/client_id verified against the
+    official binary, but the actual POST got 403 Forbidden -- the real
+    client does something in that flow, e.g. device attestation or PKCE
+    context from the original login, that isn't safely reverse-engineerable).
+    Using the CLI's own already-logged-in session sidesteps that entirely."""
     with open(CREDS_PATH) as f:
         return json.load(f)["claudeAiOauth"]["accessToken"]
 
