@@ -109,7 +109,14 @@ def check_connectivity():
 
 
 USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
-_usage_cache = {"result": None, "next_allowed_fetch": 0, "last_success_at": None}
+_usage_cache = {"result": None, "next_allowed_fetch": 0, "last_success_at": None, "last_creds_mtime": None}
+
+
+def _creds_mtime():
+    try:
+        return os.path.getmtime(CREDS_PATH)
+    except Exception:
+        return None
 
 
 def _load_usage_cache():
@@ -180,10 +187,22 @@ def get_usage():
     """Cached: only actually calls the API every USAGE_POLL_INTERVAL (longer
     still after a 429, respecting Retry-After) -- this endpoint doesn't need
     to be polled every render frame, and polling it that aggressively is
-    exactly what caused the 429s in the first place."""
+    exactly what caused the 429s in the first place.
+
+    Exception: if the credentials file's mtime has changed since the last
+    attempt, retry immediately regardless of the backoff. Without this, a
+    token that expires generates a run of 401/429s that schedule a long
+    Retry-After wait -- then claude-refresh.timer fixes the token, but the
+    display just sits on stale data until that old backoff (sometimes
+    ~50min) expires on its own, because nothing tells it the token it was
+    failing with is no longer the token it has now. This was the cause of
+    every "LCD showing stale data" report after a token refresh so far."""
     now = time.time()
-    if now >= _usage_cache["next_allowed_fetch"]:
+    creds_mtime = _creds_mtime()
+    creds_changed = creds_mtime is not None and creds_mtime != _usage_cache["last_creds_mtime"]
+    if now >= _usage_cache["next_allowed_fetch"] or creds_changed:
         result, wait = _fetch_usage()
+        _usage_cache["last_creds_mtime"] = creds_mtime
         _usage_cache["next_allowed_fetch"] = now + wait
         if result["ok"]:
             _usage_cache["result"] = result
