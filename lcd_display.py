@@ -343,7 +343,7 @@ CLOCK_BOX = (270, 8, 190, 40)  # x, y, w, h
 # well above the WEEKLY block at y=195, since the flash should only fire on
 # session % updates, not weekly ones.
 SESSION_FLASH_BOX = (0, 84, WIDTH, 86)  # x, y, w, h
-FLASH_COLOR = (255, 255, 255)
+FLASH_COLOR = (220, 30, 30)
 FLASH_DURATION = 0.12  # seconds -- long enough to register as a flash, short
 # enough not to visibly stall the display loop
 
