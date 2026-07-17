@@ -259,6 +259,23 @@ def check_session_events(five_hour):
     _session_state["last_milestone"] = current_milestone
 
 
+_last_session_pct = {"value": None}
+
+
+def check_session_pct_flash(five_hour):
+    """True exactly when the session utilization % actually changed since
+    the last check -- deliberately separate from the 5%-milestone beep
+    above, since this should fire on *any* real update (e.g. 14% -> 15%),
+    not just a 5-point crossing. First observation after a service
+    (re)start just baselines rather than flashing immediately."""
+    pct = five_hour.get("utilization")
+    if pct is None:
+        return False
+    prev = _last_session_pct["value"]
+    _last_session_pct["value"] = pct
+    return prev is not None and pct != prev
+
+
 def format_reset(iso_str):
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
@@ -321,6 +338,19 @@ def draw_meter(draw, y, label, pct, reset_str, reset_at_str):
 # padding. Sized generously so the digit-width variance of a proportional
 # (non-monospace) font never leaves a stale pixel behind between ticks.
 CLOCK_BOX = (270, 8, 190, 40)  # x, y, w, h
+
+# Covers just the SESSION (5 HOUR) block (label through reset line) -- stops
+# well above the WEEKLY block at y=195, since the flash should only fire on
+# session % updates, not weekly ones.
+SESSION_FLASH_BOX = (0, 84, WIDTH, 86)  # x, y, w, h
+FLASH_COLOR = (255, 255, 255)
+FLASH_DURATION = 0.12  # seconds -- long enough to register as a flash, short
+# enough not to visibly stall the display loop
+
+
+def render_session_flash():
+    _, _, w, h = SESSION_FLASH_BOX
+    return Image.new("RGB", (w, h), FLASH_COLOR)
 
 
 def render_clock_region():
@@ -419,6 +449,12 @@ def main():
             if usage_result["ok"]:
                 five_hour = usage_result["data"].get("five_hour") or {}
                 check_session_events(five_hour)
+                if check_session_pct_flash(five_hour):
+                    try:
+                        write_region_to_fb(render_session_flash(), SESSION_FLASH_BOX[0], SESSION_FLASH_BOX[1])
+                        time.sleep(FLASH_DURATION)
+                    except Exception:
+                        log_error("session_pct_flash")
             img = render_frame(ip, hostname, usage_result)
             try:
                 write_to_fb(img)
