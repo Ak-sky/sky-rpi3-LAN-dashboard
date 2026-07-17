@@ -738,7 +738,10 @@ async function pingIp(ip) {
 }
 
 let lastDevices = [];
-let sortState = { field: null, dir: 1 };
+// Default to IP-ascending on every fresh page load, not just after a
+// manual header click -- previously the table showed raw server order
+// until you clicked a column, so a refresh looked "unsorted" each time.
+let sortState = { field: 'ip', dir: 1 };
 
 function deviceLinkKind(dev) {
   // Identify the extender's own row by hostname alone, not by also requiring
@@ -782,13 +785,20 @@ document.querySelectorAll('th[data-field]').forEach(th => {
     const field = th.dataset.field;
     sortState.dir = (sortState.field === field) ? sortState.dir * -1 : 1;
     sortState.field = field;
-    document.querySelectorAll('th[data-field]').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
-    th.classList.add(sortState.dir === 1 ? 'sort-asc' : 'sort-desc');
     renderDeviceRows();
   });
 });
 
 function renderDeviceRows() {
+  // Reflect sortState on the header arrows every render (not just on click)
+  // so a default sort applied at load time or by a periodic refresh still
+  // shows which column and direction is active.
+  document.querySelectorAll('th[data-field]').forEach(h => h.classList.remove('sort-asc', 'sort-desc'));
+  if (sortState.field) {
+    const activeTh = document.querySelector('th[data-field="' + sortState.field + '"]');
+    if (activeTh) activeTh.classList.add(sortState.dir === 1 ? 'sort-asc' : 'sort-desc');
+  }
+
   const search = document.getElementById('filter-search').value.trim().toLowerCase();
   const statusFilter = document.getElementById('filter-status').value;
   const linkFilter = document.getElementById('filter-link').value;
@@ -1063,10 +1073,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         with _lock:
-            devices = sorted(
-                _devices_db.values(),
-                key=lambda r: (not r.get("online"), r.get("ip") or ""),
-            )
+            # Numeric octet-by-octet, not string sort -- "192.168.1.2" must
+            # come before "192.168.1.11", which plain string comparison
+            # gets wrong (compares '2' vs '1' char-by-char).
+            def ip_key(r):
+                try:
+                    return tuple(int(p) for p in (r.get("ip") or "0.0.0.0").split("."))
+                except ValueError:
+                    return (0, 0, 0, 0)
+            devices = sorted(_devices_db.values(), key=ip_key)
             scan_info = dict(_last_scan)
         next_in_s = None
         if scan_info["at_epoch"] and not _scan_in_progress.is_set():

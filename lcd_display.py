@@ -64,6 +64,50 @@ def get_local_ip():
         return "no IP"
 
 
+PING_INTERVAL = 30  # seconds -- connectivity rarely flips faster than this,
+# and back-to-back pings every display frame would just be needless load
+PING_INTERNET_TARGET = "1.1.1.1"  # fixed IP, no DNS dependency
+
+_connectivity_state = {"router_ok": None, "internet_ok": None, "last_check": 0}
+
+
+def get_default_gateway():
+    try:
+        out = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _ping_once(host, timeout=1):
+    if not host:
+        return False
+    try:
+        r = subprocess.run(
+            ["ping", "-c", "1", "-W", str(timeout), host],
+            capture_output=True, timeout=timeout + 1,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def check_connectivity():
+    """Pings the local router (default gateway) and a fixed internet host,
+    gated to PING_INTERVAL so this doesn't run on every 15s frame redraw --
+    same cache-then-refresh pattern as get_usage()."""
+    now = time.time()
+    if now - _connectivity_state["last_check"] < PING_INTERVAL:
+        return
+    _connectivity_state["router_ok"] = _ping_once(get_default_gateway())
+    _connectivity_state["internet_ok"] = _ping_once(PING_INTERNET_TARGET)
+    _connectivity_state["last_check"] = now
+
+
 USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
 _usage_cache = {"result": None, "next_allowed_fetch": 0, "last_success_at": None}
 
@@ -364,6 +408,28 @@ def render_clock_region():
     return img
 
 
+# Sits directly below the clock, in the gap before the divider line at y=68.
+CONN_BOX = (270, 49, 190, 18)  # x, y, w, h
+
+
+def render_conn_region():
+    _, _, w, h = CONN_BOX
+    img = Image.new("RGB", (w, h), BG)
+    draw = ImageDraw.Draw(img)
+
+    def dot_color(ok):
+        if ok is None:
+            return DIM
+        return (70, 200, 110) if ok else (235, 90, 90)
+
+    # Right-aligned to match the clock above it: "RTR o   NET o"
+    draw.text((w - 106, 2), "RTR", font=font_small, fill=DIM)
+    draw.ellipse([w - 78, 3, w - 66, 15], fill=dot_color(_connectivity_state["router_ok"]))
+    draw.text((w - 56, 2), "NET", font=font_small, fill=DIM)
+    draw.ellipse([w - 28, 3, w - 16, 15], fill=dot_color(_connectivity_state["internet_ok"]))
+    return img
+
+
 def render_frame(ip, hostname, usage_result):
     img = Image.new("RGB", (WIDTH, HEIGHT), BG)
     draw = ImageDraw.Draw(img)
@@ -372,6 +438,7 @@ def render_frame(ip, hostname, usage_result):
     draw.text((20, 42), "IP " + ip, font=font_label, fill=DIM)
 
     img.paste(render_clock_region(), (CLOCK_BOX[0], CLOCK_BOX[1]))
+    img.paste(render_conn_region(), (CONN_BOX[0], CONN_BOX[1]))
 
     draw.line([(20, 68), (WIDTH - 20, 68)], fill=BAR_BG, width=1)
 
@@ -445,6 +512,7 @@ def main():
         now = time.time()
         if now >= next_full_redraw:
             ip = get_local_ip()
+            check_connectivity()
             usage_result = get_usage()
             if usage_result["ok"]:
                 five_hour = usage_result["data"].get("five_hour") or {}
