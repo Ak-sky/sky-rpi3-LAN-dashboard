@@ -24,7 +24,6 @@ FB_DEVICE = "/dev/fb1"
 WIDTH, HEIGHT = 480, 320
 FRAME_INTERVAL = 15       # seconds; cheap redraw (clock/IP) using cached usage
 USAGE_POLL_INTERVAL = 120  # seconds; the actual rate-limited API call
-USAGE_BACKOFF_DEFAULT = 300  # seconds; fallback wait on 429 if no Retry-After given -- deliberately more conservative than the normal poll interval, so an actual rate-limit hit doesn't get retried at the same aggressive cadence that caused it
 WIFI_IFACE = "wlan0"
 
 BEEP_SHORT_WAV = "/home/pi/beep_short.wav"
@@ -109,10 +108,21 @@ def check_connectivity():
 
 
 USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
-MAX_429_BACKOFF = 1800  # seconds (30 min) -- ceiling for repeated-429 escalation
+# Backoff model follows github.com/fuziontech/claude-quota-display's
+# quota_display.py: ANY failure (not just 429) doubles an accumulating
+# backoff, capped at MAX_BACKOFF, reset to INITIAL_BACKOFF only on a real
+# success. The wait actually used is max(server's Retry-After, backoff) --
+# a server-supplied hint can lengthen the wait but never shorten it below
+# what we've already earned through repeated failures. This replaces an
+# earlier, narrower design that only escalated specifically on 429 and left
+# the counter untouched on other errors -- that let a single transient
+# non-429 blip reset the whole escalation. Not special-casing error types
+# avoids that class of bug entirely.
+INITIAL_BACKOFF = 30  # seconds
+MAX_BACKOFF = 1800  # seconds (30 min)
 _usage_cache = {
     "result": None, "next_allowed_fetch": 0, "last_success_at": None,
-    "last_creds_mtime": None, "consecutive_429s": 0,
+    "last_creds_mtime": None, "backoff": INITIAL_BACKOFF,
 }
 
 
@@ -166,6 +176,10 @@ def _get_bearer_token():
 
 
 def _fetch_usage():
+    """Returns (result, retry_after) -- retry_after is the server's own
+    hint (only ever present on a 429), or None. Backoff bookkeeping lives
+    entirely in get_usage() now, not here -- this function's only job is
+    to make the call and report what happened."""
     try:
         token = _get_bearer_token()
         req = urllib.request.Request(
@@ -173,67 +187,53 @@ def _fetch_usage():
             headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return {"ok": True, "data": json.loads(resp.read())}, USAGE_POLL_INTERVAL, False
+            return {"ok": True, "data": json.loads(resp.read())}, None
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            retry_after = e.headers.get("Retry-After")
+            retry_after_hdr = e.headers.get("Retry-After")
             try:
-                wait = int(retry_after) if retry_after else USAGE_BACKOFF_DEFAULT
+                retry_after = int(retry_after_hdr) if retry_after_hdr else None
             except ValueError:
-                wait = USAGE_BACKOFF_DEFAULT
-            return {"ok": False, "error": "HTTP 429 (rate limited)"}, wait, True
-        return {"ok": False, "error": f"HTTP {e.code}"}, USAGE_POLL_INTERVAL, False
+                retry_after = None
+            return {"ok": False, "error": "HTTP 429 (rate limited)"}, retry_after
+        return {"ok": False, "error": f"HTTP {e.code}"}, None
     except Exception as e:
-        return {"ok": False, "error": str(e)[:60]}, 30, False  # transient (network etc), retry soon
+        return {"ok": False, "error": str(e)[:60]}, None  # transient (network etc)
 
 
 def get_usage():
-    """Cached: only actually calls the API every USAGE_POLL_INTERVAL (longer
-    still after a 429, respecting Retry-After) -- this endpoint doesn't need
-    to be polled every render frame, and polling it that aggressively is
-    exactly what caused the 429s in the first place.
+    """Cached: only actually calls the API when next_allowed_fetch says to.
+    On success, waits USAGE_POLL_INTERVAL and resets backoff to
+    INITIAL_BACKOFF. On ANY failure -- 429, other HTTP error, or a
+    transient network exception -- backoff doubles (capped at MAX_BACKOFF),
+    and the wait used is max(server's Retry-After, backoff). Not
+    special-casing 429 means there's no separate counter that a random
+    non-429 blip could reset early, undoing real accumulated backoff.
 
     Exception: if the credentials file's mtime has changed since the last
-    attempt, retry immediately regardless of the backoff. Without this, a
-    token that expires generates a run of 401/429s that schedule a long
-    Retry-After wait -- then claude-refresh.timer fixes the token, but the
-    display just sits on stale data until that old backoff (sometimes
-    ~50min) expires on its own, because nothing tells it the token it was
-    failing with is no longer the token it has now. This was the cause of
-    every "LCD showing stale data" report after a token refresh so far.
-
-    That override is skipped while consecutive_429s > 0, though: a rate
-    limit isn't caused by a stale token, so retrying early during an active
-    429 backoff (which claude-refresh.timer's 4-hourly run has a real
-    chance of overlapping) would just waste a request -- the exact
-    hammering pattern the escalation below exists to stop."""
+    attempt, retry immediately -- but only while backoff is still at its
+    initial value. A token refresh doesn't fix a rate limit, so overriding
+    mid-backoff would just waste a request during the exact window we're
+    trying not to hammer. Without this override at all, a token that
+    expires generates a run of failures that schedule a long wait, then
+    claude-refresh.timer fixes the token, but the display sits on stale
+    data until that old wait expires on its own -- the cause of every "LCD
+    showing stale data" report after a token refresh so far."""
     now = time.time()
     creds_mtime = _creds_mtime()
     creds_changed = creds_mtime is not None and creds_mtime != _usage_cache["last_creds_mtime"]
     should_fetch = now >= _usage_cache["next_allowed_fetch"] or (
-        creds_changed and _usage_cache["consecutive_429s"] == 0
+        creds_changed and _usage_cache["backoff"] <= INITIAL_BACKOFF
     )
     if should_fetch:
-        result, wait, rate_limited = _fetch_usage()
+        result, retry_after = _fetch_usage()
         _usage_cache["last_creds_mtime"] = creds_mtime
-        if rate_limited:
-            # The server's own Retry-After is often just single-digit
-            # seconds. Honoring that literally on every consecutive 429
-            # means retrying at roughly our own loop cadence (~15s)
-            # indefinitely -- observed live to keep a rate limit from ever
-            # clearing for 7+ hours straight, because we were the ones
-            # perpetuating it. Escalate exponentially per consecutive 429,
-            # capped at MAX_429_BACKOFF, reset only on genuine success.
-            _usage_cache["consecutive_429s"] += 1
-            escalated = wait * (2 ** min(_usage_cache["consecutive_429s"] - 1, 8))
-            wait = min(MAX_429_BACKOFF, max(wait, escalated))
-        elif result["ok"]:
-            _usage_cache["consecutive_429s"] = 0
-        # else: a non-429 failure (network blip, 401, 500, timeout) leaves
-        # consecutive_429s untouched -- it's neither evidence the rate
-        # limit cleared nor evidence it's still active, and resetting it
-        # here would let a transient error between two real 429s wipe the
-        # escalation and drop straight back to the tiny raw Retry-After.
+        if result["ok"]:
+            _usage_cache["backoff"] = INITIAL_BACKOFF
+            wait = USAGE_POLL_INTERVAL
+        else:
+            _usage_cache["backoff"] = min(_usage_cache["backoff"] * 2, MAX_BACKOFF)
+            wait = max(retry_after or 0, _usage_cache["backoff"])
         _usage_cache["next_allowed_fetch"] = now + wait
         if result["ok"]:
             _usage_cache["result"] = result
