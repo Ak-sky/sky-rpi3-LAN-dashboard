@@ -109,7 +109,11 @@ def check_connectivity():
 
 
 USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
-_usage_cache = {"result": None, "next_allowed_fetch": 0, "last_success_at": None, "last_creds_mtime": None}
+MAX_429_BACKOFF = 1800  # seconds (30 min) -- ceiling for repeated-429 escalation
+_usage_cache = {
+    "result": None, "next_allowed_fetch": 0, "last_success_at": None,
+    "last_creds_mtime": None, "consecutive_429s": 0,
+}
 
 
 def _creds_mtime():
@@ -169,7 +173,7 @@ def _fetch_usage():
             headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return {"ok": True, "data": json.loads(resp.read())}, USAGE_POLL_INTERVAL
+            return {"ok": True, "data": json.loads(resp.read())}, USAGE_POLL_INTERVAL, False
     except urllib.error.HTTPError as e:
         if e.code == 429:
             retry_after = e.headers.get("Retry-After")
@@ -177,10 +181,10 @@ def _fetch_usage():
                 wait = int(retry_after) if retry_after else USAGE_BACKOFF_DEFAULT
             except ValueError:
                 wait = USAGE_BACKOFF_DEFAULT
-            return {"ok": False, "error": "HTTP 429 (rate limited)"}, wait
-        return {"ok": False, "error": f"HTTP {e.code}"}, USAGE_POLL_INTERVAL
+            return {"ok": False, "error": "HTTP 429 (rate limited)"}, wait, True
+        return {"ok": False, "error": f"HTTP {e.code}"}, USAGE_POLL_INTERVAL, False
     except Exception as e:
-        return {"ok": False, "error": str(e)[:60]}, 30  # transient (network etc), retry soon
+        return {"ok": False, "error": str(e)[:60]}, 30, False  # transient (network etc), retry soon
 
 
 def get_usage():
@@ -201,8 +205,21 @@ def get_usage():
     creds_mtime = _creds_mtime()
     creds_changed = creds_mtime is not None and creds_mtime != _usage_cache["last_creds_mtime"]
     if now >= _usage_cache["next_allowed_fetch"] or creds_changed:
-        result, wait = _fetch_usage()
+        result, wait, rate_limited = _fetch_usage()
         _usage_cache["last_creds_mtime"] = creds_mtime
+        if rate_limited:
+            # The server's own Retry-After is often just single-digit
+            # seconds. Honoring that literally on every consecutive 429
+            # means retrying at roughly our own loop cadence (~15s)
+            # indefinitely -- observed live to keep a rate limit from ever
+            # clearing for 7+ hours straight, because we were the ones
+            # perpetuating it. Escalate exponentially per consecutive 429,
+            # capped at MAX_429_BACKOFF, reset the moment a fetch succeeds.
+            _usage_cache["consecutive_429s"] += 1
+            escalated = wait * (2 ** min(_usage_cache["consecutive_429s"] - 1, 8))
+            wait = min(MAX_429_BACKOFF, max(wait, escalated))
+        else:
+            _usage_cache["consecutive_429s"] = 0
         _usage_cache["next_allowed_fetch"] = now + wait
         if result["ok"]:
             _usage_cache["result"] = result
