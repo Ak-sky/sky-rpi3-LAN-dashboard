@@ -200,11 +200,20 @@ def get_usage():
     display just sits on stale data until that old backoff (sometimes
     ~50min) expires on its own, because nothing tells it the token it was
     failing with is no longer the token it has now. This was the cause of
-    every "LCD showing stale data" report after a token refresh so far."""
+    every "LCD showing stale data" report after a token refresh so far.
+
+    That override is skipped while consecutive_429s > 0, though: a rate
+    limit isn't caused by a stale token, so retrying early during an active
+    429 backoff (which claude-refresh.timer's 4-hourly run has a real
+    chance of overlapping) would just waste a request -- the exact
+    hammering pattern the escalation below exists to stop."""
     now = time.time()
     creds_mtime = _creds_mtime()
     creds_changed = creds_mtime is not None and creds_mtime != _usage_cache["last_creds_mtime"]
-    if now >= _usage_cache["next_allowed_fetch"] or creds_changed:
+    should_fetch = now >= _usage_cache["next_allowed_fetch"] or (
+        creds_changed and _usage_cache["consecutive_429s"] == 0
+    )
+    if should_fetch:
         result, wait, rate_limited = _fetch_usage()
         _usage_cache["last_creds_mtime"] = creds_mtime
         if rate_limited:
@@ -214,12 +223,17 @@ def get_usage():
             # indefinitely -- observed live to keep a rate limit from ever
             # clearing for 7+ hours straight, because we were the ones
             # perpetuating it. Escalate exponentially per consecutive 429,
-            # capped at MAX_429_BACKOFF, reset the moment a fetch succeeds.
+            # capped at MAX_429_BACKOFF, reset only on genuine success.
             _usage_cache["consecutive_429s"] += 1
             escalated = wait * (2 ** min(_usage_cache["consecutive_429s"] - 1, 8))
             wait = min(MAX_429_BACKOFF, max(wait, escalated))
-        else:
+        elif result["ok"]:
             _usage_cache["consecutive_429s"] = 0
+        # else: a non-429 failure (network blip, 401, 500, timeout) leaves
+        # consecutive_429s untouched -- it's neither evidence the rate
+        # limit cleared nor evidence it's still active, and resetting it
+        # here would let a transient error between two real 429s wipe the
+        # escalation and drop straight back to the tiny raw Retry-After.
         _usage_cache["next_allowed_fetch"] = now + wait
         if result["ok"]:
             _usage_cache["result"] = result
