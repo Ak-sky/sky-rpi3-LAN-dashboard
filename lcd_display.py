@@ -238,12 +238,17 @@ def get_usage():
         if result["ok"]:
             _usage_cache["result"] = result
             _usage_cache["last_success_at"] = now
-        elif _usage_cache["result"] is None:
-            # No previous good result to fall back on -- show the error.
+        elif _usage_cache["result"] is None or not _usage_cache["result"]["ok"]:
+            # No previous result, or the previous one was already an error --
+            # either way, show the fresh error. The old version of this only
+            # checked "is None", so once any error got cached it stayed
+            # frozen forever: dozens of real retries overnight kept failing
+            # and updating the schedule, but the displayed message never
+            # changed from whatever the very first error was.
             _usage_cache["result"] = result
         else:
-            # Fetch failed but we have a previous good result -- keep showing
-            # it rather than replacing a working display with an error.
+            # Fetch failed but we have a previous GOOD result -- keep
+            # showing it rather than replacing working data with an error.
             pass
         _save_usage_cache()
     return _usage_cache["result"]
