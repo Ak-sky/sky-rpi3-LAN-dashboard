@@ -1,5 +1,5 @@
 [Unit]
-Description=Claude usage + IP display on the SPI TFT (fb1)
+Description=IP + connectivity display on the SPI TFT (fb1)
 After=network-online.target
 Wants=network-online.target
 

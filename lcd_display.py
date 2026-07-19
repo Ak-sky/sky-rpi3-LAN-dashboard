@@ -1,38 +1,24 @@
 #!/usr/bin/env python3
-"""Renders Claude usage + local IP directly to the Pi's SPI TFT (fb1),
-480x320 RGB565. Runs standalone -- takes over fb1 exclusively, so fbcp
-must not be running (it would fight over the same framebuffer)."""
-import json
-import math
-import os
+"""Renders local IP + connectivity status directly to the Pi's SPI TFT
+(fb1), 480x320 RGB565. Runs standalone -- takes over fb1 exclusively, so
+fbcp must not be running (it would fight over the same framebuffer)."""
 import re
-import struct
 import subprocess
 import sys
 import time
 import traceback
-import urllib.error
-import urllib.request
-import wave
-from datetime import datetime, timezone
+from datetime import datetime
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-CREDS_PATH = "/home/pi/.claude/.credentials.json"
 FB_DEVICE = "/dev/fb1"
 WIDTH, HEIGHT = 480, 320
-FRAME_INTERVAL = 15       # seconds; cheap redraw (clock/IP) using cached usage
-USAGE_POLL_INTERVAL = 120  # seconds; the actual rate-limited API call
+FRAME_INTERVAL = 15       # seconds; cheap redraw (clock/IP)
 WIFI_IFACE = "wlan0"
-
-BEEP_SHORT_WAV = "/home/pi/beep_short.wav"
-BEEP_LONG_WAV = "/home/pi/beep_long.wav"
-MILESTONE_STEP = 5  # percent
 
 FONT_DIR = "/usr/share/fonts/truetype/dejavu"
 font_title = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 22)
-font_pct = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 40)
 font_label = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 16)
 font_small = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 14)
 font_clock = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 28)
@@ -97,8 +83,7 @@ def _ping_once(host, timeout=1):
 
 def check_connectivity():
     """Pings the local router (default gateway) and a fixed internet host,
-    gated to PING_INTERVAL so this doesn't run on every 15s frame redraw --
-    same cache-then-refresh pattern as get_usage()."""
+    gated to PING_INTERVAL so this doesn't run on every 15s frame redraw."""
     now = time.time()
     if now - _connectivity_state["last_check"] < PING_INTERVAL:
         return
@@ -107,355 +92,10 @@ def check_connectivity():
     _connectivity_state["last_check"] = now
 
 
-USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
-# Backoff model follows github.com/fuziontech/claude-quota-display's
-# quota_display.py: ANY failure (not just 429) doubles an accumulating
-# backoff, capped at MAX_BACKOFF, reset to INITIAL_BACKOFF only on a real
-# success. The wait actually used is max(server's Retry-After, backoff) --
-# a server-supplied hint can lengthen the wait but never shorten it below
-# what we've already earned through repeated failures. This replaces an
-# earlier, narrower design that only escalated specifically on 429 and left
-# the counter untouched on other errors -- that let a single transient
-# non-429 blip reset the whole escalation. Not special-casing error types
-# avoids that class of bug entirely.
-#
-# INITIAL_BACKOFF matches the reference's actual starting point: their
-# `backoff` variable starts at their poll interval itself and doubles from
-# there (300 -> 600 -> 1200 -> 1800 capped), not a separately-invented small
-# value. Same shape, but a mismatched floor would mean escalating slower
-# than the reference on the very first few failures.
-INITIAL_BACKOFF = USAGE_POLL_INTERVAL  # seconds
-MAX_BACKOFF = 1800  # seconds (30 min)
-_usage_cache = {
-    "result": None, "next_allowed_fetch": 0, "last_success_at": None,
-    "last_creds_mtime": None, "backoff": INITIAL_BACKOFF,
-}
-
-
-def _creds_mtime():
-    try:
-        return os.path.getmtime(CREDS_PATH)
-    except Exception:
-        return None
-
-
-def _load_usage_cache():
-    """Persisted to disk so a service restart (crash, redeploy, reboot)
-    doesn't reset next_allowed_fetch to 0 and immediately fire a fresh API
-    call -- an in-memory-only cache defeats the whole point of backing off
-    on repeated restarts, which is exactly what happened during iterative
-    deploys."""
-    try:
-        with open(USAGE_CACHE_PATH) as f:
-            loaded = json.load(f)
-        if isinstance(loaded, dict) and "next_allowed_fetch" in loaded:
-            _usage_cache.update(loaded)  # merge, not replace -- a persisted
-            # file from before a schema change (like adding last_success_at)
-            # must not wipe out keys the current code expects to exist
-    except FileNotFoundError:
-        pass  # normal on first-ever boot, nothing to load yet
-    except Exception:
-        log_error("_load_usage_cache")
-
-
-def _save_usage_cache():
-    try:
-        tmp = USAGE_CACHE_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(_usage_cache, f)
-        os.replace(tmp, USAGE_CACHE_PATH)
-    except Exception:
-        log_error("_save_usage_cache")
-
-
-def _get_bearer_token():
-    """Reads directly from Claude Code's own native credentials file on this
-    Pi (~/.claude/.credentials.json), kept fresh by the Pi's own logged-in
-    CLI session -- not copied from anywhere else. Implementing our own
-    refresh was tried and abandoned (endpoint/client_id verified against the
-    official binary, but the actual POST got 403 Forbidden -- the real
-    client does something in that flow, e.g. device attestation or PKCE
-    context from the original login, that isn't safely reverse-engineerable).
-    Using the CLI's own already-logged-in session sidesteps that entirely."""
-    with open(CREDS_PATH) as f:
-        return json.load(f)["claudeAiOauth"]["accessToken"]
-
-
-def _fetch_usage():
-    """Returns (result, retry_after) -- retry_after is the server's own
-    hint (only ever present on a 429), or None. Backoff bookkeeping lives
-    entirely in get_usage() now, not here -- this function's only job is
-    to make the call and report what happened."""
-    try:
-        token = _get_bearer_token()
-        req = urllib.request.Request(
-            "https://api.anthropic.com/api/oauth/usage",
-            headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return {"ok": True, "data": json.loads(resp.read())}, None
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            retry_after_hdr = e.headers.get("Retry-After")
-            try:
-                retry_after = int(retry_after_hdr) if retry_after_hdr else None
-            except ValueError:
-                retry_after = None
-            return {"ok": False, "error": "HTTP 429 (rate limited)"}, retry_after
-        return {"ok": False, "error": f"HTTP {e.code}"}, None
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:60]}, None  # transient (network etc)
-
-
-def get_usage():
-    """Cached: only actually calls the API when next_allowed_fetch says to.
-    On success, waits USAGE_POLL_INTERVAL and resets backoff to
-    INITIAL_BACKOFF. On ANY failure -- 429, other HTTP error, or a
-    transient network exception -- backoff doubles (capped at MAX_BACKOFF),
-    and the wait used is max(server's Retry-After, backoff). Not
-    special-casing 429 means there's no separate counter that a random
-    non-429 blip could reset early, undoing real accumulated backoff.
-
-    Exception: if the credentials file's mtime has changed since the last
-    attempt, retry immediately -- but only while backoff is still at its
-    initial value. A token refresh doesn't fix a rate limit, so overriding
-    mid-backoff would just waste a request during the exact window we're
-    trying not to hammer. Without this override at all, a token that
-    expires generates a run of failures that schedule a long wait, then
-    claude-refresh.timer fixes the token, but the display sits on stale
-    data until that old wait expires on its own -- the cause of every "LCD
-    showing stale data" report after a token refresh so far."""
-    now = time.time()
-    creds_mtime = _creds_mtime()
-    creds_changed = creds_mtime is not None and creds_mtime != _usage_cache["last_creds_mtime"]
-    should_fetch = now >= _usage_cache["next_allowed_fetch"] or (
-        creds_changed and _usage_cache["backoff"] <= INITIAL_BACKOFF
-    )
-    if should_fetch:
-        result, retry_after = _fetch_usage()
-        _usage_cache["last_creds_mtime"] = creds_mtime
-        if result["ok"]:
-            _usage_cache["backoff"] = INITIAL_BACKOFF
-            wait = USAGE_POLL_INTERVAL
-        else:
-            _usage_cache["backoff"] = min(_usage_cache["backoff"] * 2, MAX_BACKOFF)
-            wait = max(retry_after or 0, _usage_cache["backoff"])
-        _usage_cache["next_allowed_fetch"] = now + wait
-        if result["ok"]:
-            _usage_cache["result"] = result
-            _usage_cache["last_success_at"] = now
-        elif _usage_cache["result"] is None or not _usage_cache["result"]["ok"]:
-            # No previous result, or the previous one was already an error --
-            # either way, show the fresh error. The old version of this only
-            # checked "is None", so once any error got cached it stayed
-            # frozen forever: dozens of real retries overnight kept failing
-            # and updating the schedule, but the displayed message never
-            # changed from whatever the very first error was.
-            _usage_cache["result"] = result
-        else:
-            # Fetch failed but we have a previous GOOD result -- keep
-            # showing it rather than replacing working data with an error.
-            pass
-        _save_usage_cache()
-    return _usage_cache["result"]
-
-
-def get_usage_data_age_str():
-    """How long ago the currently-displayed usage numbers were actually
-    fetched -- distinct from when the screen itself last redrew, which can
-    be much more recent than the underlying data during a rate-limit
-    backoff. Showing frame-redraw time alone made stale data look fresh."""
-    last = _usage_cache["last_success_at"]
-    if last is None:
-        return "never"
-    age_s = int(time.time() - last)
-    if age_s < 60:
-        return f"{age_s}s ago"
-    if age_s < 3600:
-        return f"{age_s // 60}m ago"
-    return f"{age_s // 3600}h {(age_s % 3600) // 60}m ago"
-
-
-PROCESS_START = time.time()
-STALE_WARN_SECONDS = 900  # 15 min -- well beyond the normal 2 min poll
-# interval plus 429 backoff, so this only fires on a genuine stuck state
-# (e.g. expired token) rather than routine rate-limit waiting.
-
-
-def is_data_stale():
-    """True once the displayed numbers are old enough that something is
-    actually wrong (expired token, persistent network failure), not just
-    mid-backoff. A "never fetched" state is only flagged once the process
-    has had a fair chance to succeed -- otherwise every boot would flash
-    a false alarm for the first couple minutes."""
-    last = _usage_cache["last_success_at"]
-    if last is None:
-        return (time.time() - PROCESS_START) > STALE_WARN_SECONDS
-    return (time.time() - last) > STALE_WARN_SECONDS
-
-
-def _generate_tone_wav(path, freq_hz, duration_ms, volume=0.95, sample_rate=22050):
-    """Simple sine tone with a short fade in/out (avoids a click at the
-    edges), written as a stdlib wave file -- no sound assets to source
-    or commit, the script is self-contained."""
-    n_samples = int(sample_rate * duration_ms / 1000)
-    fade_samples = min(200, n_samples // 4)
-    samples = []
-    for i in range(n_samples):
-        t = i / sample_rate
-        amp = volume
-        if i < fade_samples:
-            amp *= i / fade_samples
-        elif i > n_samples - fade_samples:
-            amp *= (n_samples - i) / fade_samples
-        value = int(amp * 32767 * math.sin(2 * math.pi * freq_hz * t))
-        samples.append(struct.pack("<h", value))
-    with wave.open(path, "wb") as f:
-        f.setnchannels(1)
-        f.setsampwidth(2)
-        f.setframerate(sample_rate)
-        f.writeframes(b"".join(samples))
-
-
-def ensure_beep_files():
-    # Regenerate unconditionally -- earlier files were at 50% amplitude and
-    # too quiet to hear (confirmed by reading back the raw samples), so a
-    # stale existing-file check would keep the quiet version around forever.
-    _generate_tone_wav(BEEP_SHORT_WAV, freq_hz=1200, duration_ms=250)
-    _generate_tone_wav(BEEP_LONG_WAV, freq_hz=500, duration_ms=1000)
-
-
-def _play_wav(path):
-    try:
-        subprocess.Popen(["aplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        log_error("_play_wav")
-
-
-_session_state = {"last_milestone": None, "last_resets_at": None}
-
-
-def check_session_events(five_hour):
-    """Short beep each time session usage crosses a new 5% milestone; long
-    beep when the session window itself rolls over (detected via resets_at
-    changing to a new value). First observation after a service (re)start
-    just establishes a baseline rather than firing a beep storm for
-    whatever level usage already happens to be at."""
-    pct = five_hour.get("utilization")
-    resets_at = five_hour.get("resets_at")
-    if pct is None:
-        return
-
-    current_milestone = int(pct // MILESTONE_STEP) * MILESTONE_STEP
-
-    if _session_state["last_resets_at"] is None:
-        _session_state["last_resets_at"] = resets_at
-        _session_state["last_milestone"] = current_milestone
-        return
-
-    if resets_at and resets_at != _session_state["last_resets_at"]:
-        _play_wav(BEEP_LONG_WAV)
-        _session_state["last_resets_at"] = resets_at
-        _session_state["last_milestone"] = current_milestone
-        return
-
-    if _session_state["last_milestone"] is not None and current_milestone > _session_state["last_milestone"]:
-        _play_wav(BEEP_SHORT_WAV)
-    _session_state["last_milestone"] = current_milestone
-
-
-_last_session_pct = {"value": None}
-
-
-def check_session_pct_flash(five_hour):
-    """True exactly when the session utilization % actually changed since
-    the last check -- deliberately separate from the 5%-milestone beep
-    above, since this should fire on *any* real update (e.g. 14% -> 15%),
-    not just a 5-point crossing. First observation after a service
-    (re)start just baselines rather than flashing immediately."""
-    pct = five_hour.get("utilization")
-    if pct is None:
-        return False
-    prev = _last_session_pct["value"]
-    _last_session_pct["value"] = pct
-    return prev is not None and pct != prev
-
-
-def format_reset(iso_str):
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        secs = int((dt - datetime.now(timezone.utc)).total_seconds())
-        if secs < 0:
-            return "now"
-        days, rem = divmod(secs, 86400)
-        hours, rem = divmod(rem, 3600)
-        minutes, _ = divmod(rem, 60)
-        if days:
-            return f"{days}d {hours}h"
-        if hours:
-            return f"{hours}h {minutes}m"
-        return f"{minutes}m"
-    except Exception:
-        return "?"
-
-
-def format_reset_absolute(iso_str):
-    """The actual clock time a window resets at (local time), alongside the
-    relative countdown from format_reset() -- e.g. "4h 48m" + "20:00"."""
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).astimezone()
-        now_local = datetime.now().astimezone()
-        if dt.date() == now_local.date():
-            return dt.strftime("%H:%M")
-        return dt.strftime("%a %H:%M")
-    except Exception:
-        return "?"
-
-
-def color_for_pct(pct):
-    if pct is None:
-        return DIM
-    if pct < 50:
-        return (70, 200, 110)
-    if pct < 80:
-        return (235, 190, 60)
-    return (235, 90, 90)
-
-
-def draw_meter(draw, y, label, pct, reset_str, reset_at_str):
-    color = color_for_pct(pct)
-    draw.text((20, y), label, font=font_label, fill=DIM)
-    pct_text = f"{pct:.0f}%" if pct is not None else "--"
-    draw.text((20, y + 20), pct_text, font=font_pct, fill=color)
-
-    bar_x, bar_y, bar_w, bar_h = 150, y + 38, 310, 14
-    draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=BAR_BG)
-    if pct is not None:
-        fill_w = max(0, min(bar_w, int(bar_w * pct / 100)))
-        if fill_w > 0:
-            draw.rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], fill=color)
-
-    if reset_str:
-        draw.text((150, y + 58), f"Resets in {reset_str}, {reset_at_str}", font=font_small, fill=DIM)
-
-
 # Fixed box the clock always renders into -- big enough for "23:59:59" with
 # padding. Sized generously so the digit-width variance of a proportional
 # (non-monospace) font never leaves a stale pixel behind between ticks.
 CLOCK_BOX = (270, 8, 190, 40)  # x, y, w, h
-
-# Covers just the SESSION (5 HOUR) block (label through reset line) -- stops
-# well above the WEEKLY block at y=195, since the flash should only fire on
-# session % updates, not weekly ones.
-SESSION_FLASH_BOX = (0, 84, WIDTH, 86)  # x, y, w, h
-FLASH_COLOR = (220, 30, 30)
-FLASH_DURATION = 0.12  # seconds -- long enough to register as a flash, short
-# enough not to visibly stall the display loop
-
-
-def render_session_flash():
-    _, _, w, h = SESSION_FLASH_BOX
-    return Image.new("RGB", (w, h), FLASH_COLOR)
 
 
 def render_clock_region():
@@ -491,7 +131,7 @@ def render_conn_region():
     return img
 
 
-def render_frame(ip, hostname, usage_result):
+def render_frame(ip, hostname):
     img = Image.new("RGB", (WIDTH, HEIGHT), BG)
     draw = ImageDraw.Draw(img)
 
@@ -502,35 +142,6 @@ def render_frame(ip, hostname, usage_result):
     img.paste(render_conn_region(), (CONN_BOX[0], CONN_BOX[1]))
 
     draw.line([(20, 68), (WIDTH - 20, 68)], fill=BAR_BG, width=1)
-
-    stale = is_data_stale()
-
-    if usage_result["ok"]:
-        data = usage_result["data"]
-        five_hour = data.get("five_hour") or {}
-        seven_day = data.get("seven_day") or {}
-        session_resets_at = five_hour.get("resets_at")
-        weekly_resets_at = seven_day.get("resets_at")
-        draw_meter(draw, 90, "SESSION (5 HOUR)", five_hour.get("utilization"),
-                   format_reset(session_resets_at), format_reset_absolute(session_resets_at))
-        draw_meter(draw, 195, "WEEKLY", seven_day.get("utilization"),
-                   format_reset(weekly_resets_at), format_reset_absolute(weekly_resets_at))
-    else:
-        draw.text((20, 130), "Claude usage unavailable", font=font_label, fill=(235, 90, 90))
-        draw.text((20, 155), usage_result["error"], font=font_small, fill=DIM)
-
-    if not usage_result["ok"] or stale:
-        # A dim gray footer line was easy to miss from across the room --
-        # this is the whole reason the 100%-stuck bug went unnoticed for as
-        # long as it did. A solid red banner is impossible to miss at a
-        # glance, which is the actual point of "don't make me debug again".
-        banner_h = 24
-        draw.rectangle([0, HEIGHT - banner_h, WIDTH, HEIGHT], fill=(180, 30, 30))
-        msg = "STALE DATA -- CHECK TOKEN" if stale else "USAGE FETCH FAILING"
-        draw.text((20, HEIGHT - banner_h + 4), f"{msg} ({get_usage_data_age_str()})",
-                   font=font_small, fill=(255, 255, 255))
-    else:
-        draw.text((20, HEIGHT - 26), "usage data: " + get_usage_data_age_str(), font=font_small, fill=DIM)
 
     return img
 
@@ -565,8 +176,6 @@ def write_region_to_fb(img, x0, y0):
 
 
 def main():
-    ensure_beep_files()
-    _load_usage_cache()
     hostname = subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()
     next_full_redraw = 0
     while True:
@@ -574,17 +183,7 @@ def main():
         if now >= next_full_redraw:
             ip = get_local_ip()
             check_connectivity()
-            usage_result = get_usage()
-            if usage_result["ok"]:
-                five_hour = usage_result["data"].get("five_hour") or {}
-                check_session_events(five_hour)
-                if check_session_pct_flash(five_hour):
-                    try:
-                        write_region_to_fb(render_session_flash(), SESSION_FLASH_BOX[0], SESSION_FLASH_BOX[1])
-                        time.sleep(FLASH_DURATION)
-                    except Exception:
-                        log_error("session_pct_flash")
-            img = render_frame(ip, hostname, usage_result)
+            img = render_frame(ip, hostname)
             try:
                 write_to_fb(img)
             except Exception:
