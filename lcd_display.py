@@ -118,7 +118,13 @@ USAGE_CACHE_PATH = "/home/pi/.usage_cache.json"
 # the counter untouched on other errors -- that let a single transient
 # non-429 blip reset the whole escalation. Not special-casing error types
 # avoids that class of bug entirely.
-INITIAL_BACKOFF = 30  # seconds
+#
+# INITIAL_BACKOFF matches the reference's actual starting point: their
+# `backoff` variable starts at their poll interval itself and doubles from
+# there (300 -> 600 -> 1200 -> 1800 capped), not a separately-invented small
+# value. Same shape, but a mismatched floor would mean escalating slower
+# than the reference on the very first few failures.
+INITIAL_BACKOFF = USAGE_POLL_INTERVAL  # seconds
 MAX_BACKOFF = 1800  # seconds (30 min)
 _usage_cache = {
     "result": None, "next_allowed_fetch": 0, "last_success_at": None,
