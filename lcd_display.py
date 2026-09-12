@@ -233,7 +233,7 @@ def render_preview_layer(cam_frame, x=None, y=None, w=None, h=None):
         img.paste(overlay, (w - ts_w - 18, 8), overlay)
     else:
         draw = ImageDraw.Draw(img)
-        clock_str = datetime.now().strftime("%H:%M:%S")
+        clock_str = datetime.now().strftime("%H:%M")
         bbox = draw.textbbox((0, 0), clock_str, font=font_offline_clock)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         draw.text(((w - tw) / 2, (h - th) / 2 - bbox[1]), clock_str, font=font_offline_clock, fill=FG)
