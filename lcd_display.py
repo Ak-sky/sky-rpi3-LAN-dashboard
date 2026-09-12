@@ -33,7 +33,7 @@ font_title = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 22)
 font_label = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 16)
 font_small = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 14)
 font_clock = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 28)
-font_offline_clock = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 48)
+font_offline_clock = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 64)
 
 BG = (18, 18, 18)
 FG = (235, 235, 235)
