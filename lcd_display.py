@@ -33,6 +33,7 @@ font_title = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 22)
 font_label = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 16)
 font_small = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans.ttf", 14)
 font_clock = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 28)
+font_offline_clock = ImageFont.truetype(f"{FONT_DIR}/DejaVuSans-Bold.ttf", 48)
 
 BG = (18, 18, 18)
 FG = (235, 235, 235)
@@ -232,6 +233,16 @@ def render_preview_layer(cam_frame, x=None, y=None, w=None, h=None):
         img.paste(overlay, (w - ts_w - 18, 8), overlay)
     else:
         draw = ImageDraw.Draw(img)
+        clock_str = datetime.now().strftime("%H:%M:%S")
+        bbox = draw.textbbox((0, 0), clock_str, font=font_offline_clock)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((w - tw) / 2, (h - th) / 2 - bbox[1]), clock_str, font=font_offline_clock, fill=FG)
+
+        date_str = datetime.now().strftime("%A, %d %B %Y")
+        date_bbox = draw.textbbox((0, 0), date_str, font=font_label)
+        date_w = date_bbox[2] - date_bbox[0]
+        draw.text(((w - date_w) / 2, (h + th) / 2 + 10), date_str, font=font_label, fill=DIM)
+
         draw.text((10, h - 22), "stream offline", font=font_small, fill=DIM)
     return img
 
