@@ -425,6 +425,25 @@ def save_db():
     os.replace(tmp, DB_PATH)
 
 
+MISS_THRESHOLD = 2  # consecutive failed sweeps (nmap miss + ping fallback miss) before flipping offline
+
+
+def _quick_ping_ok(ip):
+    """Fallback liveness check for a device nmap's host-discovery sweep
+    missed this round. Some WiFi clients (e.g. IP cameras) sporadically
+    miss an ARP reply under load/power-save but still answer ICMP a moment
+    later -- without this a single bad sweep wrongly flips them offline."""
+    try:
+        out = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", ip],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        m = re.search(r"(\d+) packets transmitted, (\d+) received", out)
+        return bool(m and int(m.group(2)) > 0)
+    except Exception:
+        return False
+
+
 def update_db(scanned_devices):
     """Keyed by IP, not MAC: a WiFi repeater/mesh node on this network
     (RE305) answers ARP for several IPs under one MAC, and keying by MAC
@@ -450,11 +469,27 @@ def update_db(scanned_devices):
             rec["ports"] = d["ports"]
             rec["last_seen"] = now
             rec["online"] = True
+            rec["miss_streak"] = 0
             _devices_db[key] = rec
-        for key, rec in _devices_db.items():
-            if key not in seen_keys:
-                rec["online"] = False
+        missing = [(key, rec) for key, rec in _devices_db.items() if key not in seen_keys]
+
+    # Pinged outside _lock -- each ping blocks up to ~1-3s and we don't want
+    # to stall /devices reads while a batch of misses gets rechecked.
+    for key, rec in missing:
+        alive = _quick_ping_ok(key)
+        with _lock:
+            if alive:
+                rec["online"] = True
+                rec["miss_streak"] = 0
+                rec["last_seen"] = now
                 rec["latency_ms"] = None
+            else:
+                rec["miss_streak"] = rec.get("miss_streak", 0) + 1
+                if rec["miss_streak"] >= MISS_THRESHOLD:
+                    rec["online"] = False
+                    rec["latency_ms"] = None
+
+    with _lock:
         save_db()
 
 
