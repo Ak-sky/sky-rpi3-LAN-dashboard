@@ -408,21 +408,54 @@ def run_scan():
         return None
 
 
+_mac_ip_history = {}  # mac -> list of every distinct IP ever seen for it
+
+
 def load_db():
-    global _devices_db
+    global _devices_db, _mac_ip_history
     try:
         with open(DB_PATH) as f:
-            _devices_db = json.load(f)
+            loaded = json.load(f)
     except Exception:
         _devices_db = {}
+        _mac_ip_history = {}
+        return
+    if "devices" in loaded and "mac_ip_history" in loaded:
+        _devices_db = loaded["devices"]
+        _mac_ip_history = loaded["mac_ip_history"]
+    else:
+        # Old on-disk format: a flat {ip: record} dict. Seed history from
+        # the current rows so nothing existing looks like a "move" the
+        # first time this runs post-upgrade.
+        _devices_db = loaded
+        _mac_ip_history = {}
+        for rec in _devices_db.values():
+            if rec.get("mac"):
+                _mac_ip_history.setdefault(rec["mac"], [])
+                if rec["ip"] not in _mac_ip_history[rec["mac"]]:
+                    _mac_ip_history[rec["mac"]].append(rec["ip"])
 
 
 def save_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     tmp = DB_PATH + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(_devices_db, f, indent=2)
+        json.dump({"devices": _devices_db, "mac_ip_history": _mac_ip_history}, f, indent=2)
     os.replace(tmp, DB_PATH)
+
+
+def forget_device(ip):
+    """Manually drop a device's row, e.g. after reassigning it a static IP
+    elsewhere (router UI) -- the dashboard has no way to know that happened
+    on its own, so the stale offline row lingers until told to go."""
+    if not ip or not IP_RE.match(ip):
+        return {"ok": False, "error": "invalid IP address"}
+    with _lock:
+        if ip not in _devices_db:
+            return {"ok": False, "error": "no such device"}
+        del _devices_db[ip]
+        save_db()
+    return {"ok": True}
 
 
 MISS_THRESHOLD = 2  # consecutive failed sweeps (nmap miss + ping fallback miss) before flipping offline
@@ -455,6 +488,27 @@ def update_db(scanned_devices):
         for d in scanned_devices:
             key = d["ip"]
             seen_keys.add(key)
+
+            # Auto-retire a stale row when a MAC with a clean single-IP
+            # history (never shared, never seen elsewhere) shows up at a
+            # new IP -- a real device move (e.g. switched to a static IP).
+            # Any MAC that has EVER been shared or multi-homed is excluded
+            # for good: this network's TP-Link mesh gear reuses/shifts MACs
+            # across scans, so trusting it here would risk merging two
+            # unrelated devices (see the RE305 note below).
+            if d["mac"] and d["link"] != "via_extender":
+                prior_ips = _mac_ip_history.get(d["mac"], [])
+                if len(prior_ips) == 1 and prior_ips[0] != key and prior_ips[0] in _devices_db:
+                    del _devices_db[prior_ips[0]]
+                if key not in prior_ips:
+                    _mac_ip_history.setdefault(d["mac"], []).append(key)
+            elif d["mac"]:
+                # via_extender this round -- shared MAC, never eligible for
+                # auto-merge again even if it later looks "clean".
+                _mac_ip_history.setdefault(d["mac"], [])
+                if key not in _mac_ip_history[d["mac"]]:
+                    _mac_ip_history[d["mac"]].append(key)
+
             rec = _devices_db.get(key, {"first_seen": now})
             rec["ip"] = d["ip"]
             rec["mac"] = d["mac"]
@@ -715,6 +769,7 @@ DASHBOARD_HTML = """<!doctype html>
           <th data-field="first_seen" data-type="string">First Seen</th>
           <th data-field="last_seen" data-type="string">Last Seen</th>
           <th>Ping</th>
+          <th>Actions</th>
         </tr>
       </thead>
       <tbody id="device-rows"></tbody>
@@ -770,6 +825,16 @@ async function pingIp(ip) {
   }
   renderDeviceRows();
   setTimeout(renderDeviceRows, 8100);
+}
+
+async function forgetIp(ip) {
+  if (!confirm('Remove ' + ip + ' from the device list?\n\nUse this for a stale row left behind after reassigning the device a different IP elsewhere (e.g. a static IP change). It comes back on its own if anything ever answers at this IP again.')) {
+    return;
+  }
+  try {
+    await fetch('/forget?ip=' + encodeURIComponent(ip), { method: 'POST' });
+  } catch (e) {}
+  refresh();
 }
 
 let lastDevices = [];
@@ -886,7 +951,8 @@ function renderDeviceRows() {
       '<td>' + ports + '</td>' +
       '<td>' + (dev.first_seen || '—') + '</td>' +
       '<td>' + (dev.last_seen || '—') + '</td>' +
-      '<td>' + (dev.ip ? pingButtonHtml(dev.ip) : '—') + '</td>';
+      '<td>' + (dev.ip ? pingButtonHtml(dev.ip) : '—') + '</td>' +
+      '<td>' + (dev.ip && !dev.online ? '<button class="ping-btn ping-bad" onclick="forgetIp(\\'' + dev.ip + '\\')">Forget</button>' : '—') + '</td>';
     rows.appendChild(tr);
   }
 }
@@ -1154,6 +1220,9 @@ class Handler(BaseHTTPRequestHandler):
             result = ping_host(ip)
         elif parsed.path == "/reboot":
             result = trigger_reboot()
+        elif parsed.path == "/forget":
+            ip = urllib.parse.parse_qs(parsed.query).get("ip", [None])[0]
+            result = forget_device(ip)
         else:
             self.send_response(404)
             self.end_headers()
