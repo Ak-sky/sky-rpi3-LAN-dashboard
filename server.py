@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal stdlib-only LAN device dashboard: nmap scan in a background
 thread, cached results served as JSON + a live-refreshing HTML page."""
+import csv
 import json
 import os
 import re
@@ -35,6 +36,26 @@ VENDOR_HINTS = {
     "e4:5f:01": "Raspberry Pi Trading",
     "28:cd:c1": "Raspberry Pi Trading",
 }
+
+# IEEE's registry (https://standards-oui.ieee.org/oui/oui.csv); nmap 7.80's
+# bundled list is from 2019 and misses most current phones/TVs.
+OUI_PATH = os.path.expanduser("~/lan-dashboard-data/oui.csv")
+_oui = None
+
+
+def lookup_vendor(mac):
+    global _oui
+    if int(mac[1], 16) & 0x2:
+        return "Private (randomized MAC)"
+    if _oui is None:
+        _oui = {}
+        try:
+            with open(OUI_PATH, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    _oui[row["Assignment"].upper()] = row["Organization Name"].strip()
+        except OSError:
+            pass
+    return _oui.get(mac.replace(":", "")[:6].upper(), "Unknown")
 
 _lock = threading.Lock()
 _devices_db = {}
@@ -365,6 +386,8 @@ def parse_nmap_output(output, self_id):
             prefix = d["mac"][:8].lower()
             if prefix in VENDOR_HINTS:
                 d["vendor"] = VENDOR_HINTS[prefix]
+            elif not d["vendor"] or d["vendor"] == "Unknown":
+                d["vendor"] = lookup_vendor(d["mac"])
 
     # One MAC answering ARP for several IPs in the same scan (proxy ARP)
     # means that MAC can't identify a single device -- update_db uses this
@@ -383,7 +406,9 @@ def run_scan():
     start = time.time()
     try:
         out = subprocess.run(
-            ["sudo", "nmap", "-T4", "--top-ports", "30", SUBNET],
+            # --system-dns: nmap's own async resolver randomly drops PTR
+            # answers from the router here; the system resolver doesn't.
+            ["sudo", "nmap", "-T4", "--system-dns", "--top-ports", "30", SUBNET],
             capture_output=True, text=True, timeout=90,
         ).stdout
         devices = parse_nmap_output(out, get_self_identity())
@@ -501,6 +526,10 @@ def update_db(scanned_devices):
                     _mac_ip_history.setdefault(d["mac"], []).append(key)
 
             rec = _devices_db.get(key, {"first_seen": now})
+            # A different MAC at this IP is a different device (DHCP handed
+            # the IP on) -- don't let it inherit the old one's name/vendor.
+            if rec.get("mac") and d["mac"] and rec["mac"] != d["mac"]:
+                rec = {"first_seen": now}
             rec["ip"] = d["ip"]
             rec["mac"] = d["mac"]
             rec["hostname"] = d["hostname"] or rec.get("hostname")
