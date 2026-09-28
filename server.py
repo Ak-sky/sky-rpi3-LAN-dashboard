@@ -828,7 +828,7 @@ async function pingIp(ip) {
 }
 
 async function forgetIp(ip) {
-  if (!confirm('Remove ' + ip + ' from the device list?\n\nUse this for a stale row left behind after reassigning the device a different IP elsewhere (e.g. a static IP change). It comes back on its own if anything ever answers at this IP again.')) {
+  if (!confirm('Remove ' + ip + ' from the device list?\\n\\nUse this for a stale row left behind after reassigning the device a different IP elsewhere (e.g. a static IP change). It comes back on its own if anything ever answers at this IP again.')) {
     return;
   }
   try {
