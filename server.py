@@ -19,6 +19,8 @@ SCAN_INTERVAL = 90  # seconds; a full /24 sweep takes ~20-25s on a Pi 3
 DB_PATH = os.path.expanduser("~/lan-dashboard-data/devices.json")
 
 WIFI_IFACE = "wlan0"
+# RE305 is static here; the router's DNS names it "ArcherC6v2", so hostname alone can't find it.
+EXTENDER_IP = "192.168.1.2"
 INTERNET_CHECK_HOST = "8.8.8.8"
 INTERNET_CHECK_PORT = 53
 INTERNET_CHECK_INTERVAL = 20  # seconds
@@ -838,6 +840,7 @@ async function forgetIp(ip) {
 }
 
 let lastDevices = [];
+let extenderIp = null;
 // Default to IP-ascending on every fresh page load, not just after a
 // manual header click -- previously the table showed raw server order
 // until you clicked a column, so a refresh looked "unsorted" each time.
@@ -850,7 +853,7 @@ function deviceLinkKind(dev) {
   // management IP has been observed to shift across scans and not match the
   // extender's real hardware MAC at all. Hostname via mDNS is the stable signal.
   const isExtenderHost = dev.hostname && dev.hostname.toUpperCase().includes('RE305');
-  if (isExtenderHost) return 'extender';
+  if (isExtenderHost || (extenderIp && dev.ip === extenderIp)) return 'extender';
   if (dev.link === 'via_extender') return 'via_extender';
   return 'direct';
 }
@@ -967,6 +970,7 @@ async function refresh() {
     const d = await r.json();
     const devices = d.devices || [];
     lastDevices = devices;
+    extenderIp = d.extender_ip || null;
 
     document.getElementById('stat-total').textContent = devices.length;
     document.getElementById('stat-online').textContent = devices.filter(x => x.online).length;
@@ -1202,6 +1206,7 @@ class Handler(BaseHTTPRequestHandler):
             "internet": internet,
             "internet_events": internet_events,
             "speedtest": speedtest,
+            "extender_ip": EXTENDER_IP,
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
