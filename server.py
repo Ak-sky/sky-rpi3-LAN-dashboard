@@ -412,6 +412,11 @@ def run_scan():
             capture_output=True, text=True, timeout=90,
         ).stdout
         devices = parse_nmap_output(out, get_self_identity())
+        if not devices:
+            # nmap always reports this Pi itself, so zero hosts means our own
+            # network is down (e.g. WiFi not up yet at boot). Counting it as
+            # a real scan would mark every device offline.
+            raise RuntimeError("no hosts found -- this Pi's network looks down")
         _last_scan.update({
             "at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
             "at_epoch": time.time(),
@@ -519,8 +524,11 @@ def update_db(scanned_devices):
             # here reuses/shifts MACs and could merge unrelated devices.
             if d["mac"]:
                 prior_ips = _mac_ip_history.get(d["mac"], [])
-                if (d["shared_mac_count"] == 1 and len(prior_ips) == 1
-                        and prior_ips[0] != key and prior_ips[0] in _devices_db):
+                old = _devices_db.get(prior_ips[0]) if len(prior_ips) == 1 else None
+                # old["mac"] check: that IP may already belong to another
+                # device processed earlier in this same scan.
+                if (d["shared_mac_count"] == 1 and old is not None
+                        and prior_ips[0] != key and old.get("mac") == d["mac"]):
                     del _devices_db[prior_ips[0]]
                 if key not in prior_ips:
                     _mac_ip_history.setdefault(d["mac"], []).append(key)
