@@ -19,8 +19,6 @@ SCAN_INTERVAL = 90  # seconds; a full /24 sweep takes ~20-25s on a Pi 3
 DB_PATH = os.path.expanduser("~/lan-dashboard-data/devices.json")
 
 WIFI_IFACE = "wlan0"
-# RE305 is static here; the router's DNS names it "ArcherC6v2", so hostname alone can't find it.
-EXTENDER_IP = "192.168.1.2"
 INTERNET_CHECK_HOST = "8.8.8.8"
 INTERNET_CHECK_PORT = 53
 INTERNET_CHECK_INTERVAL = 20  # seconds
@@ -368,17 +366,15 @@ def parse_nmap_output(output, self_id):
             if prefix in VENDOR_HINTS:
                 d["vendor"] = VENDOR_HINTS[prefix]
 
-    # A MAC answering ARP for more than one IP in the same scan is a
-    # WiFi extender/repeater proxy-ARPing for the devices behind it --
-    # we can't see those devices' real MACs, only the extender's.
+    # One MAC answering ARP for several IPs in the same scan (proxy ARP)
+    # means that MAC can't identify a single device -- update_db uses this
+    # to keep such rows out of the stale-row auto-merge.
     mac_counts = {}
     for d in devices:
         if d["mac"]:
             mac_counts[d["mac"]] = mac_counts.get(d["mac"], 0) + 1
     for d in devices:
-        group_size = mac_counts.get(d["mac"], 1) if d["mac"] else 1
-        d["link"] = "via_extender" if group_size > 1 else "direct"
-        d["shared_mac_count"] = group_size
+        d["shared_mac_count"] = mac_counts.get(d["mac"], 1) if d["mac"] else 1
 
     return devices
 
@@ -480,10 +476,10 @@ def _quick_ping_ok(ip):
 
 
 def update_db(scanned_devices):
-    """Keyed by IP, not MAC: a WiFi repeater/mesh node on this network
-    (RE305) answers ARP for several IPs under one MAC, and keying by MAC
-    collapsed those into a single overwritten row -- exactly the kind of
-    wrong-IP bug this dashboard exists to avoid."""
+    """Keyed by IP, not MAC: some gear on this network proxy-ARPs several
+    IPs under one MAC, and keying by MAC collapsed those into a single
+    overwritten row -- exactly the kind of wrong-IP bug this dashboard
+    exists to avoid."""
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     seen_keys = set()
     with _lock:
@@ -492,24 +488,17 @@ def update_db(scanned_devices):
             seen_keys.add(key)
 
             # Auto-retire a stale row when a MAC with a clean single-IP
-            # history (never shared, never seen elsewhere) shows up at a
-            # new IP -- a real device move (e.g. switched to a static IP).
-            # Any MAC that has EVER been shared or multi-homed is excluded
-            # for good: this network's TP-Link mesh gear reuses/shifts MACs
-            # across scans, so trusting it here would risk merging two
-            # unrelated devices (see the RE305 note below).
-            if d["mac"] and d["link"] != "via_extender":
+            # history shows up at a new IP -- a real device move (e.g.
+            # switched to a static IP). A MAC ever seen at 2+ IPs (shared
+            # or moved before) is excluded for good, since the TP-Link gear
+            # here reuses/shifts MACs and could merge unrelated devices.
+            if d["mac"]:
                 prior_ips = _mac_ip_history.get(d["mac"], [])
-                if len(prior_ips) == 1 and prior_ips[0] != key and prior_ips[0] in _devices_db:
+                if (d["shared_mac_count"] == 1 and len(prior_ips) == 1
+                        and prior_ips[0] != key and prior_ips[0] in _devices_db):
                     del _devices_db[prior_ips[0]]
                 if key not in prior_ips:
                     _mac_ip_history.setdefault(d["mac"], []).append(key)
-            elif d["mac"]:
-                # via_extender this round -- shared MAC, never eligible for
-                # auto-merge again even if it later looks "clean".
-                _mac_ip_history.setdefault(d["mac"], [])
-                if key not in _mac_ip_history[d["mac"]]:
-                    _mac_ip_history[d["mac"]].append(key)
 
             rec = _devices_db.get(key, {"first_seen": now})
             rec["ip"] = d["ip"]
@@ -520,8 +509,8 @@ def update_db(scanned_devices):
             else:
                 rec.setdefault("vendor", d["vendor"])
             rec["latency_ms"] = d["latency_ms"]
-            rec["link"] = d["link"]
-            rec["shared_mac_count"] = d["shared_mac_count"]
+            rec.pop("link", None)
+            rec.pop("shared_mac_count", None)
             rec["ports"] = d["ports"]
             rec["last_seen"] = now
             rec["online"] = True
@@ -735,7 +724,6 @@ DASHBOARD_HTML = """<!doctype html>
   <div class="stat-card"><div class="num" id="stat-total">&mdash;</div><div class="label">Known devices</div></div>
   <div class="stat-card online"><div class="num" id="stat-online">&mdash;</div><div class="label">Online now</div></div>
   <div class="stat-card offline"><div class="num" id="stat-offline">&mdash;</div><div class="label">Offline</div></div>
-  <div class="stat-card" id="extender-card"><div class="num" id="stat-extender">&mdash;</div><div class="label" id="extender-label">Extender</div></div>
   <div class="stat-card" id="internet-card"><div class="num" id="stat-internet">&mdash;</div><div class="label">Internet</div></div>
 </div>
 
@@ -746,12 +734,6 @@ DASHBOARD_HTML = """<!doctype html>
       <option value="all">All statuses</option>
       <option value="online">Online</option>
       <option value="offline">Offline</option>
-    </select>
-    <select id="filter-link" class="filter-select">
-      <option value="all">All links</option>
-      <option value="direct">Direct</option>
-      <option value="via_extender">Via Extender</option>
-      <option value="extender">Extender</option>
     </select>
     <span class="filter-count" id="filter-count"></span>
   </div>
@@ -765,7 +747,6 @@ DASHBOARD_HTML = """<!doctype html>
           <th data-field="mac" data-type="string">MAC</th>
           <th data-field="hostname" data-type="string">Hostname</th>
           <th data-field="vendor" data-type="string">Vendor</th>
-          <th data-field="link" data-type="string">Link</th>
           <th data-field="latency_ms" data-type="number">Latency</th>
           <th data-field="ports" data-type="number">Open Ports</th>
           <th data-field="first_seen" data-type="string">First Seen</th>
@@ -840,26 +821,12 @@ async function forgetIp(ip) {
 }
 
 let lastDevices = [];
-let extenderIp = null;
 // Default to IP-ascending on every fresh page load, not just after a
 // manual header click -- previously the table showed raw server order
 // until you clicked a column, so a refresh looked "unsorted" each time.
 let sortState = { field: 'ip', dir: 1 };
 
-function deviceLinkKind(dev) {
-  // Identify the extender's own row by hostname alone, not by also requiring
-  // the shared-MAC heuristic to agree -- this Pi's WiFi keeps roaming (see
-  // dmesg cfg80211 warnings), and the MAC ARP reports for the extender's own
-  // management IP has been observed to shift across scans and not match the
-  // extender's real hardware MAC at all. Hostname via mDNS is the stable signal.
-  const isExtenderHost = dev.hostname && dev.hostname.toUpperCase().includes('RE305');
-  if (isExtenderHost || (extenderIp && dev.ip === extenderIp)) return 'extender';
-  if (dev.link === 'via_extender') return 'via_extender';
-  return 'direct';
-}
-
 function sortFieldValue(dev, field) {
-  if (field === 'link') return deviceLinkKind(dev);
   if (field === 'ports') return (dev.ports || []).length;
   if (field === 'online') return dev.online ? 1 : 0;
   return dev[field];
@@ -904,12 +871,10 @@ function renderDeviceRows() {
 
   const search = document.getElementById('filter-search').value.trim().toLowerCase();
   const statusFilter = document.getElementById('filter-status').value;
-  const linkFilter = document.getElementById('filter-link').value;
 
   const filtered = lastDevices.filter(dev => {
     if (statusFilter === 'online' && !dev.online) return false;
     if (statusFilter === 'offline' && dev.online) return false;
-    if (linkFilter !== 'all' && deviceLinkKind(dev) !== linkFilter) return false;
     if (search) {
       const haystack = [dev.ip, dev.mac, dev.hostname, dev.vendor].filter(Boolean).join(' ').toLowerCase();
       if (!haystack.includes(search)) return false;
@@ -938,9 +903,6 @@ function renderDeviceRows() {
     const tr = document.createElement('tr');
     tr.className = dev.online ? '' : 'offline';
     const pill = '<span class="pill ' + (dev.online ? 'ok">online' : 'bad">offline') + '</span>';
-    const linkKind = deviceLinkKind(dev);
-    const linkLabel = linkKind === 'extender' ? 'Extender' : linkKind === 'via_extender' ? 'Via Extender' : 'Direct';
-    const linkPill = '<span class="pill ' + (linkKind === 'direct' ? 'ok' : 'bad') + '">' + linkLabel + '</span>';
     const ports = (dev.ports || []).map(p => p.port + '/' + p.service).join(', ') || '—';
     tr.innerHTML =
       '<td>' + rowNum + '</td>' +
@@ -949,7 +911,6 @@ function renderDeviceRows() {
       '<td class="mac">' + (dev.mac || '—') + '</td>' +
       '<td>' + (dev.hostname || '—') + '</td>' +
       '<td>' + (dev.vendor || 'Unknown') + '</td>' +
-      '<td>' + linkPill + '</td>' +
       '<td>' + (dev.latency_ms != null ? dev.latency_ms + ' ms' : '—') + '</td>' +
       '<td>' + ports + '</td>' +
       '<td>' + (dev.first_seen || '—') + '</td>' +
@@ -962,7 +923,6 @@ function renderDeviceRows() {
 
 document.getElementById('filter-search').addEventListener('input', renderDeviceRows);
 document.getElementById('filter-status').addEventListener('change', renderDeviceRows);
-document.getElementById('filter-link').addEventListener('change', renderDeviceRows);
 
 async function refresh() {
   try {
@@ -970,37 +930,12 @@ async function refresh() {
     const d = await r.json();
     const devices = d.devices || [];
     lastDevices = devices;
-    extenderIp = d.extender_ip || null;
 
     document.getElementById('stat-total').textContent = devices.length;
     document.getElementById('stat-online').textContent = devices.filter(x => x.online).length;
     document.getElementById('stat-offline').textContent = devices.filter(x => !x.online).length;
 
     renderDeviceRows();
-
-    let extenderOnline = null, extenderLatency = null, behindExtender = 0;
-    for (const dev of devices) {
-      const linkKind = deviceLinkKind(dev);
-      // Multiple devices can carry the extender's hostname over time (e.g. it
-      // moved IPs and a stale offline record lingers) -- once we've locked
-      // onto an online match, don't let a stale offline one clobber it.
-      if (linkKind === 'extender' && (extenderOnline === null || dev.online)) {
-        extenderOnline = dev.online;
-        extenderLatency = dev.latency_ms;
-      }
-      if (linkKind === 'via_extender') behindExtender++;
-    }
-
-    const extCard = document.getElementById('extender-card');
-    const extNum = document.getElementById('stat-extender');
-    if (extenderOnline === null) {
-      extNum.textContent = 'not seen';
-      extCard.className = 'stat-card';
-    } else {
-      extNum.textContent = (extenderOnline ? 'online' : 'offline') + (extenderLatency != null ? ' · ' + extenderLatency + 'ms' : '');
-      extCard.className = 'stat-card ' + (extenderOnline ? 'online' : 'offline');
-    }
-    document.getElementById('extender-label').textContent = 'RE305 · ' + behindExtender + ' behind it';
 
     const sv = d.self_vitals || {};
     document.getElementById('page-hostname').textContent = sv.hostname || 'unknown';
@@ -1206,7 +1141,6 @@ class Handler(BaseHTTPRequestHandler):
             "internet": internet,
             "internet_events": internet_events,
             "speedtest": speedtest,
-            "extender_ip": EXTENDER_IP,
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
