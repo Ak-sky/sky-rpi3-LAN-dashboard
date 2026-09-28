@@ -6,17 +6,21 @@ import json
 import os
 import re
 import socket
+import struct
 import subprocess
 import threading
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8000
 SUBNET = "192.168.1.0/24"
-SCAN_INTERVAL = 90  # seconds; a full /24 sweep takes ~20-25s on a Pi 3
+PRESENCE_INTERVAL = 15    # seconds between arp-scan sweeps (~3s each); drives online/offline
+FULL_SCAN_INTERVAL = 600  # seconds between nmap port/hostname scans + mDNS/SSDP discovery
+OFFLINE_AFTER = 90        # seconds unseen (then a failed ping) before a device is marked offline
 DB_PATH = os.path.expanduser("~/lan-dashboard-data/devices.json")
 
 WIFI_IFACE = "wlan0"
@@ -57,9 +61,31 @@ def lookup_vendor(mac):
             pass
     return _oui.get(mac.replace(":", "")[:6].upper(), "Unknown")
 
+
+def vendor_for(mac, nmap_vendor=None):
+    hint = VENDOR_HINTS.get(mac[:8].lower())
+    if hint:
+        return hint
+    if nmap_vendor and nmap_vendor != "Unknown":
+        return nmap_vendor
+    return lookup_vendor(mac)
+
+
+def mark_shared_macs(devices):
+    """One MAC answering ARP for several IPs in the same sweep (proxy ARP)
+    can't identify a single device -- _upsert keeps such rows out of the
+    stale-row auto-merge."""
+    counts = {}
+    for d in devices:
+        if d["mac"]:
+            counts[d["mac"]] = counts.get(d["mac"], 0) + 1
+    for d in devices:
+        d["shared_mac_count"] = counts.get(d["mac"], 1) if d["mac"] else 1
+
 _lock = threading.Lock()
 _devices_db = {}
 _last_scan = {"at": None, "at_epoch": None, "duration_s": None, "hosts_up": None, "error": None}
+_presence_state = {"at": None, "hosts_up": None, "error": None}
 
 _internet_state = {"up": None, "latency_ms": None, "last_checked": None}
 _internet_events = []
@@ -383,21 +409,9 @@ def parse_nmap_output(output, self_id):
             d["mac"] = d["mac"] or self_id["mac"]
             d["hostname"] = self_id["hostname"]
         if d["mac"]:
-            prefix = d["mac"][:8].lower()
-            if prefix in VENDOR_HINTS:
-                d["vendor"] = VENDOR_HINTS[prefix]
-            elif not d["vendor"] or d["vendor"] == "Unknown":
-                d["vendor"] = lookup_vendor(d["mac"])
+            d["vendor"] = vendor_for(d["mac"], d["vendor"])
 
-    # One MAC answering ARP for several IPs in the same scan (proxy ARP)
-    # means that MAC can't identify a single device -- update_db uses this
-    # to keep such rows out of the stale-row auto-merge.
-    mac_counts = {}
-    for d in devices:
-        if d["mac"]:
-            mac_counts[d["mac"]] = mac_counts.get(d["mac"], 0) + 1
-    for d in devices:
-        d["shared_mac_count"] = mac_counts.get(d["mac"], 1) if d["mac"] else 1
+    mark_shared_macs(devices)
 
     return devices
 
@@ -437,10 +451,12 @@ def run_scan():
 
 
 _mac_ip_history = {}  # mac -> list of every distinct IP ever seen for it
+_aliases = {}         # mac -> name set by hand in the dashboard
+_dhcp_info = {}       # mac -> {"hostname", "vendor_class"} heard in DHCP requests
 
 
 def load_db():
-    global _devices_db, _mac_ip_history
+    global _devices_db, _mac_ip_history, _aliases, _dhcp_info
     try:
         with open(DB_PATH) as f:
             loaded = json.load(f)
@@ -451,6 +467,8 @@ def load_db():
     if "devices" in loaded and "mac_ip_history" in loaded:
         _devices_db = loaded["devices"]
         _mac_ip_history = loaded["mac_ip_history"]
+        _aliases = loaded.get("aliases", {})
+        _dhcp_info = loaded.get("dhcp_info", {})
     else:
         # Old on-disk format: a flat {ip: record} dict. Seed history from
         # the current rows so nothing existing looks like a "move" the
@@ -468,7 +486,8 @@ def save_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     tmp = DB_PATH + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"devices": _devices_db, "mac_ip_history": _mac_ip_history}, f, indent=2)
+        json.dump({"devices": _devices_db, "mac_ip_history": _mac_ip_history,
+                   "aliases": _aliases, "dhcp_info": _dhcp_info}, f, indent=2)
     os.replace(tmp, DB_PATH)
 
 
@@ -486,14 +505,10 @@ def forget_device(ip):
     return {"ok": True}
 
 
-MISS_THRESHOLD = 2  # consecutive failed sweeps (nmap miss + ping fallback miss) before flipping offline
-
-
 def _quick_ping_ok(ip):
-    """Fallback liveness check for a device nmap's host-discovery sweep
-    missed this round. Some WiFi clients (e.g. IP cameras) sporadically
-    miss an ARP reply under load/power-save but still answer ICMP a moment
-    later -- without this a single bad sweep wrongly flips them offline."""
+    """Fallback liveness check for a device the presence sweep missed.
+    Some WiFi clients (e.g. IP cameras) sporadically miss an ARP reply
+    under load/power-save but still answer ICMP a moment later."""
     try:
         out = subprocess.run(
             ["ping", "-c", "1", "-W", "1", ip],
@@ -505,74 +520,505 @@ def _quick_ping_ok(ip):
         return False
 
 
-def update_db(scanned_devices):
-    """Keyed by IP, not MAC: some gear on this network proxy-ARPs several
-    IPs under one MAC, and keying by MAC collapsed those into a single
-    overwritten row -- exactly the kind of wrong-IP bug this dashboard
-    exists to avoid."""
-    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    seen_keys = set()
+def _now():
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S"), time.time()
+
+
+def _seen_epoch(rec):
+    if "last_seen_epoch" in rec:
+        return rec["last_seen_epoch"]
+    try:
+        return datetime.strptime(rec["last_seen"], "%d/%m/%Y %H:%M:%S").timestamp()
+    except (KeyError, ValueError):
+        return 0
+
+
+def _upsert(d, now, now_epoch):
+    """Record one sighting of d (ip, mac, vendor, shared_mac_count). Caller
+    holds _lock. Returns (row, changed) -- changed means something worth
+    persisting happened (new/reset/merged row, offline->online).
+
+    Rows are keyed by IP, not MAC: some gear on this network proxy-ARPs
+    several IPs under one MAC, and keying by MAC collapsed those into one
+    overwritten row."""
+    key = d["ip"]
+    changed = False
+
+    # Auto-retire a stale row when a MAC with a clean single-IP history
+    # shows up at a new IP -- a real device move (e.g. switched to a static
+    # IP). A MAC ever seen at 2+ IPs (shared or moved before) is excluded
+    # for good, since the TP-Link gear here reuses/shifts MACs and could
+    # merge unrelated devices.
+    if d["mac"]:
+        prior_ips = _mac_ip_history.get(d["mac"], [])
+        old = _devices_db.get(prior_ips[0]) if len(prior_ips) == 1 else None
+        # old["mac"] check: that IP may already belong to another device
+        # processed earlier in this same sweep.
+        if (d["shared_mac_count"] == 1 and old is not None
+                and prior_ips[0] != key and old.get("mac") == d["mac"]):
+            del _devices_db[prior_ips[0]]
+            changed = True
+        if key not in prior_ips:
+            _mac_ip_history.setdefault(d["mac"], []).append(key)
+            changed = True
+
+    rec = _devices_db.get(key)
+    # A different MAC at this IP is a different device (DHCP handed the IP
+    # on) -- don't let it inherit the old one's name/vendor/discovery data.
+    if rec is None or (rec.get("mac") and d["mac"] and rec["mac"] != d["mac"]):
+        rec = {"first_seen": now}
+        changed = True
+    if not rec.get("online"):
+        changed = True
+    rec["ip"] = key
+    rec["mac"] = d["mac"] or rec.get("mac")
+    if d.get("vendor") and d["vendor"] != "Unknown":
+        rec["vendor"] = d["vendor"]
+    else:
+        rec.setdefault("vendor", d.get("vendor") or "Unknown")
+    rec["last_seen"] = now
+    rec["last_seen_epoch"] = now_epoch
+    rec["online"] = True
+    for stale_field in ("miss_streak", "link", "shared_mac_count"):
+        rec.pop(stale_field, None)
+    _devices_db[key] = rec
+    return rec, changed
+
+
+def apply_full_scan(devices):
+    """nmap results: adds hostnames and open ports. Online/offline is left
+    to the presence sweep, which runs far more often."""
+    now, now_epoch = _now()
     with _lock:
-        for d in scanned_devices:
-            key = d["ip"]
-            seen_keys.add(key)
-
-            # Auto-retire a stale row when a MAC with a clean single-IP
-            # history shows up at a new IP -- a real device move (e.g.
-            # switched to a static IP). A MAC ever seen at 2+ IPs (shared
-            # or moved before) is excluded for good, since the TP-Link gear
-            # here reuses/shifts MACs and could merge unrelated devices.
-            if d["mac"]:
-                prior_ips = _mac_ip_history.get(d["mac"], [])
-                old = _devices_db.get(prior_ips[0]) if len(prior_ips) == 1 else None
-                # old["mac"] check: that IP may already belong to another
-                # device processed earlier in this same scan.
-                if (d["shared_mac_count"] == 1 and old is not None
-                        and prior_ips[0] != key and old.get("mac") == d["mac"]):
-                    del _devices_db[prior_ips[0]]
-                if key not in prior_ips:
-                    _mac_ip_history.setdefault(d["mac"], []).append(key)
-
-            rec = _devices_db.get(key, {"first_seen": now})
-            # A different MAC at this IP is a different device (DHCP handed
-            # the IP on) -- don't let it inherit the old one's name/vendor.
-            if rec.get("mac") and d["mac"] and rec["mac"] != d["mac"]:
-                rec = {"first_seen": now}
-            rec["ip"] = d["ip"]
-            rec["mac"] = d["mac"]
+        for d in devices:
+            rec, _ = _upsert(d, now, now_epoch)
             rec["hostname"] = d["hostname"] or rec.get("hostname")
-            if d["vendor"] and d["vendor"] != "Unknown":
-                rec["vendor"] = d["vendor"]
-            else:
-                rec.setdefault("vendor", d["vendor"])
-            rec["latency_ms"] = d["latency_ms"]
-            rec.pop("link", None)
-            rec.pop("shared_mac_count", None)
             rec["ports"] = d["ports"]
-            rec["last_seen"] = now
-            rec["online"] = True
-            rec["miss_streak"] = 0
-            _devices_db[key] = rec
-        missing = [(key, rec) for key, rec in _devices_db.items() if key not in seen_keys]
-
-    # Pinged outside _lock -- each ping blocks up to ~1-3s and we don't want
-    # to stall /devices reads while a batch of misses gets rechecked.
-    for key, rec in missing:
-        alive = _quick_ping_ok(key)
-        with _lock:
-            if alive:
-                rec["online"] = True
-                rec["miss_streak"] = 0
-                rec["last_seen"] = now
-                rec["latency_ms"] = None
-            else:
-                rec["miss_streak"] = rec.get("miss_streak", 0) + 1
-                if rec["miss_streak"] >= MISS_THRESHOLD:
-                    rec["online"] = False
-                    rec["latency_ms"] = None
-
-    with _lock:
+            if d["latency_ms"] is not None:
+                rec["latency_ms"] = d["latency_ms"]
         save_db()
+
+
+def apply_presence(devices):
+    now, now_epoch = _now()
+    self_ip = get_self_identity()["ip"]
+    changed = False
+    with _lock:
+        seen = set()
+        for d in devices:
+            rec, row_changed = _upsert(d, now, now_epoch)
+            changed = changed or row_changed
+            if d["latency_ms"] is not None:
+                rec["latency_ms"] = d["latency_ms"]
+            seen.add(d["ip"])
+        # arp-scan can't see the host it runs on.
+        if self_ip in _devices_db:
+            _devices_db[self_ip].update(online=True, last_seen=now, last_seen_epoch=now_epoch)
+            seen.add(self_ip)
+        overdue = [ip for ip, rec in _devices_db.items()
+                   if ip not in seen and rec.get("online")
+                   and now_epoch - _seen_epoch(rec) >= OFFLINE_AFTER]
+        unnamed = [ip for ip in seen if not _devices_db[ip].get("hostname")
+                   and not _devices_db[ip].get("dns_checked")]
+
+    # Outside _lock: pings and DNS lookups block, and /devices reads
+    # shouldn't stall on them.
+    for ip in overdue:
+        alive = _quick_ping_ok(ip)
+        with _lock:
+            rec = _devices_db.get(ip)
+            if rec is None:
+                continue
+            if alive:
+                rec.update(last_seen=now, last_seen_epoch=now_epoch)
+            else:
+                rec["online"] = False
+                rec["latency_ms"] = None
+                changed = True
+    for ip in unnamed:
+        try:
+            name = socket.gethostbyaddr(ip)[0]
+        except OSError:
+            name = None
+        with _lock:
+            rec = _devices_db.get(ip)
+            if rec is not None:
+                rec["dns_checked"] = True
+                if name:
+                    rec["hostname"] = name
+                changed = True
+
+    if changed:
+        with _lock:
+            save_db()
+
+
+ARP_LINE_RE = re.compile(r"^(\d+\.\d+\.\d+\.\d+)\t([0-9a-fA-F:]{17})\t.*?(?:RTT=([\d.]+) ms)?$")
+
+
+def run_presence_sweep():
+    try:
+        out = subprocess.run(
+            ["sudo", "arp-scan", "-I", WIFI_IFACE, "--localnet", "--plain",
+             "--rtt", "--retry=3", "--ignoredups"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except Exception as e:
+        _presence_state.update(at=_now()[0], hosts_up=None, error=str(e))
+        return None
+    devices = []
+    for line in out.splitlines():
+        m = ARP_LINE_RE.match(line)
+        if m:
+            mac = m.group(2).upper()
+            devices.append({
+                "ip": m.group(1), "mac": mac, "vendor": vendor_for(mac),
+                "latency_ms": round(float(m.group(3)), 1) if m.group(3) else None,
+            })
+    if not devices:
+        # The router always answers ARP, so silence means our own network
+        # is down -- don't let that mark every device offline.
+        _presence_state.update(at=_now()[0], hosts_up=0, error="no ARP replies -- this Pi's network looks down")
+        return None
+    mark_shared_macs(devices)
+    _presence_state.update(at=_now()[0], hosts_up=len(devices), error=None)
+    return devices
+
+
+def presence_loop():
+    while True:
+        # Skipped while nmap runs: both ARP-sweep the subnet, and the
+        # overlap just adds noise on a Pi 3's WiFi.
+        if not _scan_in_progress.is_set():
+            devices = run_presence_sweep()
+            if devices is not None:
+                apply_presence(devices)
+        time.sleep(PRESENCE_INTERVAL)
+
+
+MDNS_GROUP = ("224.0.0.251", 5353)
+SSDP_GROUP = ("239.255.255.250", 1900)
+# Which TXT key holds the model depends on the service: "md" is the model
+# for Cast devices but "supported metadata types" for AirPlay audio (_raop).
+MDNS_MODEL_KEYS = (
+    ("_airplay._tcp", "model"),
+    ("_device-info._tcp", "model"),
+    ("_raop._tcp", "am"),
+    ("_googlecast._tcp", "md"),
+    ("_ipp._tcp", "ty"),
+    ("_printer._tcp", "ty"),
+)
+
+
+def _multicast_socket(ttl):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+    self_ip = get_self_identity()["ip"]
+    if self_ip:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self_ip))
+    sock.bind(("", 0))
+    return sock
+
+
+def _collect(sock, timeout):
+    replies, deadline = [], time.time() + timeout
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            return replies
+        sock.settimeout(left)
+        try:
+            buf, addr = sock.recvfrom(9000)
+        except OSError:
+            return replies
+        replies.append((buf, addr[0]))
+
+
+def _dns_labels(buf, off):
+    """Decode a (possibly compressed) DNS name -> (labels, next offset)."""
+    labels, end = [], None
+    for _ in range(64):  # bounded: a malicious pointer loop just stops here
+        n = buf[off]
+        if n == 0:
+            off += 1
+            break
+        if n & 0xC0 == 0xC0:
+            if end is None:
+                end = off + 2
+            off = ((n & 0x3F) << 8) | buf[off + 1]
+            continue
+        labels.append(buf[off + 1:off + 1 + n].decode("utf-8", "replace"))
+        off += 1 + n
+    return labels, (end if end is not None else off)
+
+
+def _dns_records(buf):
+    """All answer/authority/additional records as (labels, type, rdata_off, rdlen).
+    Malformed packets yield whatever parsed before the damage."""
+    out = []
+    try:
+        qd, an, ns, ar = struct.unpack(">HHHH", buf[4:12])
+        off = 12
+        for _ in range(qd):
+            _, off = _dns_labels(buf, off)
+            off += 4
+        for _ in range(an + ns + ar):
+            labels, off = _dns_labels(buf, off)
+            rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", buf[off:off + 10])
+            off += 10
+            out.append((labels, rtype, off, rdlen))
+            off += rdlen
+    except (IndexError, struct.error):
+        pass
+    return out
+
+
+def _mdns_ask(sock, names, timeout):
+    questions = b"".join(
+        b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0" + struct.pack(">HH", 12, 1)
+        for name in names
+    )
+    try:
+        sock.sendto(struct.pack(">6H", 1, 0, len(names), 0, 0, 0) + questions, MDNS_GROUP)
+    except OSError:
+        return []
+    return _collect(sock, timeout)
+
+
+def _txt(data):
+    out, i = {}, 0
+    while i < len(data):
+        n = data[i]
+        entry = data[i + 1:i + 1 + n].decode("utf-8", "replace")
+        i += 1 + n
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            out.setdefault(k, v)
+    return out
+
+
+def _clean_instance_name(name):
+    name = name.split("@", 1)[-1]           # _raop: "A1B2C3D4E5F6@Living Room"
+    name = re.sub(r"\s*\[[0-9a-fA-F:]+\]$", "", name)  # _workstation: "host [aa:bb:..]"
+    if re.fullmatch(r"[0-9a-fA-F-]{12,}", name) or re.search(r"-[0-9a-f]{16,}$", name):
+        return None                          # bare UUID / "Chromecast-<hex>"
+    return name.strip() or None
+
+
+def mdns_discover(timeout=2.0):
+    """Ask every mDNS responder what services it offers. Sent from an
+    ephemeral port, so responders reply unicast straight to us (RFC 6762
+    legacy unicast) and we never have to share 5353 with avahi.
+    Returns {ip: {"name", "model", "services"}}."""
+    try:
+        sock = _multicast_socket(255)
+    except OSError:
+        return {}
+    with sock:
+        meta = "_services._dns-sd._udp.local"
+        types = set()
+        for buf, _ip in _mdns_ask(sock, [meta], timeout):
+            for labels, rtype, off, _ in _dns_records(buf):
+                if rtype == 12 and ".".join(labels) == meta:
+                    types.add(".".join(_dns_labels(buf, off)[0]))
+        types = sorted(t for t in types if t.endswith(".local"))[:40]
+
+        per_ip = {}
+        for i in range(0, len(types), 10):
+            for buf, ip in _mdns_ask(sock, types[i:i + 10], timeout):
+                info = per_ip.setdefault(ip, {"names": [], "services": set(), "txt": {}})
+                for labels, rtype, off, rdlen in _dns_records(buf):
+                    if rtype == 12 and ".".join(labels) in types:
+                        info["services"].add(".".join(labels[:2]))
+                        instance = _dns_labels(buf, off)[0]
+                        if instance:
+                            info["names"].append(instance[0])
+                    elif rtype == 16 and len(labels) >= 3:
+                        # TXT owner is "<instance>.<_svc>.<_proto>.local"
+                        service = ".".join(labels[-3:-1])
+                        info["txt"].setdefault(service, {}).update(_txt(buf[off:off + rdlen]))
+
+    self_ip = get_self_identity()["ip"]
+    found = {}
+    for ip, info in per_ip.items():
+        if ip == self_ip:
+            continue  # Samba advertises this Pi as "MacSamba"; we know what it is
+        txt = info["txt"]
+        name = (txt.get("_googlecast._tcp", {}).get("fn")
+                or next(filter(None, map(_clean_instance_name, info["names"])), None))
+        model = next((txt[svc][key] for svc, key in MDNS_MODEL_KEYS if txt.get(svc, {}).get(key)), None)
+        found[ip] = {"name": name, "model": model, "services": sorted(info["services"])}
+    return found
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# No env proxies, no redirects: description fetches must only ever reach
+# the LAN device that answered the M-SEARCH.
+_lan_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def _upnp_description(ip, url):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "http" or parsed.hostname != ip:
+        return None
+    try:
+        with _lan_opener.open(url, timeout=2) as resp:
+            data = resp.read(65536)
+    except Exception:
+        return None
+    if re.search(rb"<!(DOCTYPE|ENTITY)", data, re.IGNORECASE):
+        return None  # refuse entity declarations outright (billion-laughs etc.)
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return None
+
+    def first(tag):
+        for el in root.iter():
+            if el.tag.rsplit("}", 1)[-1] == tag and el.text and el.text.strip():
+                return el.text.strip()
+        return None
+
+    name = first("friendlyName")
+    model = " ".join(x for x in (first("manufacturer"), first("modelName")) if x) or None
+    return {"name": name, "model": model} if (name or model) else None
+
+
+def ssdp_discover(timeout=3.0):
+    """M-SEARCH for UPnP devices (TVs, media boxes, consoles), then read
+    each one's description XML for a friendly name and model.
+    Returns {ip: {"name", "model"}}."""
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+           'MAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n').encode()
+    try:
+        sock = _multicast_socket(2)
+    except OSError:
+        return {}
+    locations = {}
+    with sock:
+        try:
+            sock.sendto(msg, SSDP_GROUP)
+            sock.sendto(msg, SSDP_GROUP)  # UDP over WiFi drops; a second copy is cheap
+        except OSError:
+            return {}
+        for buf, ip in _collect(sock, timeout):
+            for line in buf.decode("latin-1").split("\r\n"):
+                if line.lower().startswith("location:"):
+                    locations.setdefault(ip, set()).add(line.split(":", 1)[1].strip())
+    found = {}
+    for ip, locs in locations.items():
+        for loc in sorted(locs):
+            info = _upnp_description(ip, loc)
+            if info:
+                found[ip] = info
+                break
+    return found
+
+
+def apply_discovery(mdns, ssdp):
+    with _lock:
+        for field, results in (("mdns", mdns), ("upnp", ssdp)):
+            for ip, info in results.items():
+                if ip in _devices_db:
+                    _devices_db[ip][field] = info
+        save_db()
+
+
+DHCP_REQUEST_RE = re.compile(r"Request from ([0-9a-fA-F:]{17})")
+DHCP_OPTION_RE = re.compile(r'(Hostname|Vendor-Class)\s*(?:Option\s*)?\(?(?:12|60)\)?,\s*length \d+: "(.*)"')
+
+
+def _record_dhcp(mac, field, value):
+    value = value[:64]
+    with _lock:
+        info = _dhcp_info.setdefault(mac, {})
+        if info.get(field) != value:
+            info[field] = value
+            save_db()
+
+
+def dhcp_listener_loop():
+    """Passively picks up the hostname and OS hint (Vendor-Class, e.g.
+    "android-dhcp-13", "MSFT 5.0") devices send when they join the WiFi.
+    DHCP requests are broadcast, so this Pi hears other clients' too."""
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["sudo", "tcpdump", "-l", "-n", "-v", "-i", WIFI_IFACE, "udp and (port 67 or port 68)"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, errors="replace",
+            )
+            mac = None
+            for line in proc.stdout:
+                if not line[:1].isspace():  # unindented line = next packet's header
+                    mac = None
+                    continue
+                m = DHCP_REQUEST_RE.search(line)
+                if m:
+                    mac = m.group(1).upper()
+                    continue
+                if mac:
+                    m = DHCP_OPTION_RE.search(line)
+                    if m:
+                        _record_dhcp(mac, "hostname" if m.group(1) == "Hostname" else "vendor_class", m.group(2))
+            proc.wait()
+        except Exception as e:
+            print(f"dhcp listener: {e}", flush=True)
+        time.sleep(30)
+
+
+MAC_RE = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+
+
+def set_alias(mac, name):
+    mac = (mac or "").upper()
+    if not MAC_RE.match(mac):
+        return {"ok": False, "error": "invalid MAC address"}
+    name = (name or "").strip()[:64]
+    with _lock:
+        if name:
+            _aliases[mac] = name
+        else:
+            _aliases.pop(mac, None)
+        save_db()
+    return {"ok": True}
+
+
+DHCP_OS_HINTS = (("android-dhcp", "Android"), ("MSFT", "Windows"), ("dhcpcd", "Linux"), ("udhcp", "Embedded Linux"))
+MDNS_KINDS = {
+    "_googlecast._tcp": "Chromecast / Cast device",
+    "_androidtvremote2._tcp": "Android TV",
+    "_amzn-wplay._tcp": "Amazon Fire TV",
+    "_airplay._tcp": "AirPlay device",
+    "_companion-link._tcp": "Apple device",
+    "_hap._tcp": "HomeKit accessory",
+    "_ipp._tcp": "Printer",
+    "_printer._tcp": "Printer",
+    "_spotify-connect._tcp": "Spotify Connect speaker",
+    "_workstation._tcp": "Computer",
+}
+
+
+def device_view(rec):
+    """Row + best-guess display name and model. Caller holds _lock."""
+    mac = rec.get("mac")
+    dhcp = _dhcp_info.get(mac, {}) if mac else {}
+    mdns = rec.get("mdns") or {}
+    upnp = rec.get("upnp") or {}
+    alias = _aliases.get(mac) if mac else None
+    vendor_class = dhcp.get("vendor_class") or ""
+    os_hint = next((os_name for prefix, os_name in DHCP_OS_HINTS if vendor_class.startswith(prefix)), None)
+    kind = next((MDNS_KINDS[s] for s in mdns.get("services", []) if s in MDNS_KINDS), None)
+    return dict(
+        rec,
+        alias=alias,
+        name=alias or upnp.get("name") or mdns.get("name") or dhcp.get("hostname") or rec.get("hostname"),
+        model=upnp.get("model") or mdns.get("model") or kind or os_hint,
+        dhcp=dhcp or None,
+    )
 
 
 _scan_trigger = threading.Event()
@@ -587,14 +1033,14 @@ def trigger_scan():
 
 
 def scan_loop():
-    load_db()
     while True:
         _scan_in_progress.set()
         scanned = run_scan()
         if scanned is not None:
-            update_db(scanned)
+            apply_full_scan(scanned)
+            apply_discovery(mdns_discover(), ssdp_discover())
         _scan_in_progress.clear()
-        _scan_trigger.wait(timeout=SCAN_INTERVAL)
+        _scan_trigger.wait(timeout=FULL_SCAN_INTERVAL)
         _scan_trigger.clear()
 
 
@@ -697,6 +1143,7 @@ DASHBOARD_HTML = """<!doctype html>
   tbody tr.offline { opacity: .5; }
   .mac { font-variant-numeric: tabular-nums; }
   .pill { font-size: .68rem; padding: .18rem .5rem; border-radius: 999px; white-space: nowrap; }
+  .sub { display: block; font-size: .7rem; color: var(--label); }
   .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-fg); }
   .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-fg); }
   .status-bar { display: flex; justify-content: center; align-items: baseline; gap: 1.2rem; font-size: .72rem; color: var(--updated); flex-wrap: wrap; }
@@ -766,7 +1213,7 @@ DASHBOARD_HTML = """<!doctype html>
 
 <div class="table-card">
   <div class="filter-bar">
-    <input type="text" id="filter-search" class="filter-search" placeholder="Search IP, MAC, hostname, vendor…">
+    <input type="text" id="filter-search" class="filter-search" placeholder="Search IP, MAC, name, vendor, model…">
     <select id="filter-status" class="filter-select">
       <option value="all">All statuses</option>
       <option value="online">Online</option>
@@ -782,8 +1229,9 @@ DASHBOARD_HTML = """<!doctype html>
           <th data-field="online" data-type="bool">Status</th>
           <th data-field="ip" data-type="ip">IP</th>
           <th data-field="mac" data-type="string">MAC</th>
-          <th data-field="hostname" data-type="string">Hostname</th>
+          <th data-field="name" data-type="string">Name</th>
           <th data-field="vendor" data-type="string">Vendor</th>
+          <th data-field="model" data-type="string">Model / Type</th>
           <th data-field="latency_ms" data-type="number">Latency</th>
           <th data-field="ports" data-type="number">Open Ports</th>
           <th data-field="first_seen" data-type="string">First Seen</th>
@@ -857,6 +1305,23 @@ async function forgetIp(ip) {
   refresh();
 }
 
+// Names/models come from DHCP, mDNS and UPnP -- i.e. from whatever any
+// device on the network chooses to announce. Never put them in innerHTML raw.
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function esc(v) {
+  return String(v).replace(/[&<>"']/g, c => HTML_ESCAPES[c]);
+}
+
+async function renameDevice(mac) {
+  const dev = lastDevices.find(d => d.mac === mac) || {};
+  const name = prompt('Name for ' + mac + ' (leave empty to clear):', dev.alias || dev.name || '');
+  if (name === null) return;
+  try {
+    await fetch('/alias?mac=' + encodeURIComponent(mac) + '&name=' + encodeURIComponent(name), { method: 'POST' });
+  } catch (e) {}
+  refresh();
+}
+
 let lastDevices = [];
 // Default to IP-ascending on every fresh page load, not just after a
 // manual header click -- previously the table showed raw server order
@@ -913,7 +1378,8 @@ function renderDeviceRows() {
     if (statusFilter === 'online' && !dev.online) return false;
     if (statusFilter === 'offline' && dev.online) return false;
     if (search) {
-      const haystack = [dev.ip, dev.mac, dev.hostname, dev.vendor].filter(Boolean).join(' ').toLowerCase();
+      const haystack = [dev.ip, dev.mac, dev.name, dev.hostname, dev.vendor, dev.model,
+        dev.dhcp && dev.dhcp.vendor_class].filter(Boolean).join(' ').toLowerCase();
       if (!haystack.includes(search)) return false;
     }
     return true;
@@ -941,19 +1407,29 @@ function renderDeviceRows() {
     tr.className = dev.online ? '' : 'offline';
     const pill = '<span class="pill ' + (dev.online ? 'ok">online' : 'bad">offline') + '</span>';
     const ports = (dev.ports || []).map(p => p.port + '/' + p.service).join(', ') || '—';
+    // Show the DNS hostname underneath when a better name replaced it.
+    const nameCell = dev.name
+      ? esc(dev.name) + (dev.hostname && dev.hostname !== dev.name ? '<span class="sub">' + esc(dev.hostname) + '</span>' : '')
+      : '—';
+    const osHint = dev.dhcp && dev.dhcp.vendor_class && dev.model !== dev.dhcp.vendor_class
+      ? '<span class="sub">' + esc(dev.dhcp.vendor_class) + '</span>' : '';
     tr.innerHTML =
       '<td>' + rowNum + '</td>' +
       '<td>' + pill + '</td>' +
-      '<td>' + (dev.ip || '—') + '</td>' +
-      '<td class="mac">' + (dev.mac || '—') + '</td>' +
-      '<td>' + (dev.hostname || '—') + '</td>' +
-      '<td>' + (dev.vendor || 'Unknown') + '</td>' +
+      '<td>' + esc(dev.ip || '—') + '</td>' +
+      '<td class="mac">' + esc(dev.mac || '—') + '</td>' +
+      '<td>' + nameCell + '</td>' +
+      '<td>' + esc(dev.vendor || 'Unknown') + '</td>' +
+      '<td>' + (dev.model ? esc(dev.model) : '—') + osHint + '</td>' +
       '<td>' + (dev.latency_ms != null ? dev.latency_ms + ' ms' : '—') + '</td>' +
-      '<td>' + ports + '</td>' +
-      '<td>' + (dev.first_seen || '—') + '</td>' +
-      '<td>' + (dev.last_seen || '—') + '</td>' +
+      '<td>' + esc(ports) + '</td>' +
+      '<td>' + esc(dev.first_seen || '—') + '</td>' +
+      '<td>' + esc(dev.last_seen || '—') + '</td>' +
       '<td>' + (dev.ip ? pingButtonHtml(dev.ip) : '—') + '</td>' +
-      '<td>' + (dev.ip && !dev.online ? '<button class="ping-btn ping-bad" onclick="forgetIp(\\'' + dev.ip + '\\')">Forget</button>' : '—') + '</td>';
+      '<td>' +
+        (dev.mac ? '<button class="ping-btn" onclick="renameDevice(\\'' + esc(dev.mac) + '\\')">Rename</button> ' : '') +
+        (dev.ip && !dev.online ? '<button class="ping-btn ping-bad" onclick="forgetIp(\\'' + esc(dev.ip) + '\\')">Forget</button>' : '') +
+      '</td>';
     rows.appendChild(tr);
   }
 }
@@ -1037,12 +1513,16 @@ async function refresh() {
 
     const scan = d.last_scan || {};
     const statusBar = document.getElementById('status-bar');
-    statusBar.innerHTML = scan.error
-      ? '<span><b>Last scan failed:</b> ' + scan.error + '</span>'
-      : '<span><b>Last scan:</b> ' + scan.at + '</span>' +
-        '<span><b>Took:</b> ' + scan.duration_s + 's</span>' +
-        '<span><b>Found:</b> ' + scan.hosts_up + ' devices</span>' +
-        '<span><b>Next scan:</b> ' + (d.scan_in_progress ? 'running now' : (d.next_scan_in_s != null ? 'in ' + d.next_scan_in_s + 's' : '—')) + '</span>';
+    const pr = d.presence || {};
+    const presenceHtml = pr.error
+      ? '<span><b>Presence check failed:</b> ' + esc(pr.error) + '</span>'
+      : '<span><b>Presence (every ' + d.presence_interval_s + 's):</b> ' + (pr.hosts_up != null ? pr.hosts_up + ' up at ' + esc(pr.at) : '—') + '</span>';
+    const nextScan = d.scan_in_progress ? 'running now'
+      : (d.next_scan_in_s != null ? 'in ' + formatDuration(d.next_scan_in_s) : '—');
+    statusBar.innerHTML = presenceHtml + (scan.error
+      ? '<span><b>Last full scan failed:</b> ' + esc(scan.error) + '</span>'
+      : '<span><b>Last full scan:</b> ' + esc(scan.at) + ' (' + scan.duration_s + 's, ' + scan.hosts_up + ' found)</span>') +
+      '<span><b>Next full scan:</b> ' + nextScan + '</span>';
 
     const scanBtn = document.getElementById('scan-btn');
     if (d.scan_in_progress) {
@@ -1158,11 +1638,12 @@ class Handler(BaseHTTPRequestHandler):
                     return tuple(int(p) for p in (r.get("ip") or "0.0.0.0").split("."))
                 except ValueError:
                     return (0, 0, 0, 0)
-            devices = sorted(_devices_db.values(), key=ip_key)
+            devices = [device_view(r) for r in sorted(_devices_db.values(), key=ip_key)]
             scan_info = dict(_last_scan)
+            presence = dict(_presence_state)
         next_in_s = None
         if scan_info["at_epoch"] and not _scan_in_progress.is_set():
-            next_in_s = max(0, round(SCAN_INTERVAL - (time.time() - scan_info["at_epoch"])))
+            next_in_s = max(0, round(FULL_SCAN_INTERVAL - (time.time() - scan_info["at_epoch"])))
         del scan_info["at_epoch"]
         with _lock:
             internet = dict(_internet_state)
@@ -1172,7 +1653,9 @@ class Handler(BaseHTTPRequestHandler):
             "devices": devices,
             "last_scan": scan_info,
             "next_scan_in_s": next_in_s,
-            "scan_interval_s": SCAN_INTERVAL,
+            "scan_interval_s": FULL_SCAN_INTERVAL,
+            "presence": presence,
+            "presence_interval_s": PRESENCE_INTERVAL,
             "scan_in_progress": _scan_in_progress.is_set(),
             "self_vitals": get_self_vitals(),
             "internet": internet,
@@ -1199,6 +1682,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/forget":
             ip = urllib.parse.parse_qs(parsed.query).get("ip", [None])[0]
             result = forget_device(ip)
+        elif parsed.path == "/alias":
+            qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+            result = set_alias(qs.get("mac", [None])[0], qs.get("name", [""])[0])
         else:
             self.send_response(404)
             self.end_headers()
@@ -1212,7 +1698,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    load_db()  # before any thread touches the DB
     threading.Thread(target=scan_loop, daemon=True).start()
+    threading.Thread(target=presence_loop, daemon=True).start()
+    threading.Thread(target=dhcp_listener_loop, daemon=True).start()
     threading.Thread(target=internet_check_loop, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()
