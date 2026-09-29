@@ -1160,6 +1160,8 @@ DASHBOARD_HTML = """<!doctype html>
   .mac { font-variant-numeric: tabular-nums; }
   .pill { font-size: .68rem; padding: .18rem .5rem; border-radius: 999px; white-space: nowrap; }
   .sub { display: block; font-size: .7rem; color: var(--label); }
+  .name-btn { background: none; border: 0; padding: 0; font: inherit; color: inherit; text-align: left; cursor: pointer; }
+  .name-btn:hover, .name-btn:focus-visible { text-decoration: underline dotted; }
   .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-fg); }
   .pill.bad { background: var(--pill-bad-bg); color: var(--pill-bad-fg); }
   .status-bar { display: flex; justify-content: center; align-items: baseline; gap: 1.2rem; font-size: .72rem; color: var(--updated); flex-wrap: wrap; }
@@ -1424,9 +1426,11 @@ function renderDeviceRows() {
     const pill = '<span class="pill ' + (dev.online ? 'ok">online' : 'bad">offline') + '</span>';
     const ports = (dev.ports || []).map(p => p.port + '/' + p.service).join(', ') || '—';
     // Show the DNS hostname underneath when a better name replaced it.
-    const nameCell = dev.name
-      ? esc(dev.name) + (dev.hostname && dev.hostname !== dev.name ? '<span class="sub">' + esc(dev.hostname) + '</span>' : '')
-      : '—';
+    const nameText = dev.name ? esc(dev.name) : '—';
+    const nameCell = (dev.mac
+        ? '<button class="name-btn" title="Click to rename" onclick="renameDevice(\\'' + esc(dev.mac) + '\\')">' + nameText + '</button>'
+        : nameText) +
+      (dev.hostname && dev.name && dev.hostname !== dev.name ? '<span class="sub">' + esc(dev.hostname) + '</span>' : '');
     const osHint = dev.dhcp && dev.dhcp.vendor_class && dev.model !== dev.dhcp.vendor_class
       ? '<span class="sub">' + esc(dev.dhcp.vendor_class) + '</span>' : '';
     tr.innerHTML =
@@ -1442,10 +1446,7 @@ function renderDeviceRows() {
       '<td>' + esc(dev.first_seen || '—') + '</td>' +
       '<td>' + esc(dev.last_seen || '—') + '</td>' +
       '<td>' + (dev.ip ? pingButtonHtml(dev.ip) : '—') + '</td>' +
-      '<td>' +
-        (dev.mac ? '<button class="ping-btn" onclick="renameDevice(\\'' + esc(dev.mac) + '\\')">Rename</button> ' : '') +
-        (dev.ip && !dev.online ? '<button class="ping-btn ping-bad" onclick="forgetIp(\\'' + esc(dev.ip) + '\\')">Forget</button>' : '') +
-      '</td>';
+      '<td>' + (dev.ip && !dev.online ? '<button class="ping-btn ping-bad" onclick="forgetIp(\\'' + esc(dev.ip) + '\\')">Forget</button>' : '—') + '</td>';
     rows.appendChild(tr);
   }
 }
@@ -1535,9 +1536,10 @@ async function refresh() {
       : '<span><b>Presence (every ' + d.presence_interval_s + 's):</b> ' + (pr.hosts_up != null ? pr.hosts_up + ' up at ' + esc(pr.at) : '—') + '</span>';
     const nextScan = d.scan_in_progress ? 'running now'
       : (d.next_scan_in_s != null ? 'in ' + formatDuration(d.next_scan_in_s) : '—');
-    statusBar.innerHTML = presenceHtml + (scan.error
+    const scanHtml = scan.error
       ? '<span><b>Last full scan failed:</b> ' + esc(scan.error) + '</span>'
-      : '<span><b>Last full scan:</b> ' + esc(scan.at) + ' (' + scan.duration_s + 's, ' + scan.hosts_up + ' found)</span>') +
+      : '<span><b>Last full scan:</b> ' + (scan.at ? esc(scan.at) + ' (' + scan.duration_s + 's, ' + scan.hosts_up + ' found)' : '—') + '</span>';
+    statusBar.innerHTML = presenceHtml + scanHtml +
       '<span><b>Next full scan:</b> ' + nextScan + '</span>';
 
     const scanBtn = document.getElementById('scan-btn');
