@@ -21,6 +21,7 @@ SUBNET = "192.168.1.0/24"
 PRESENCE_INTERVAL = 15    # seconds between arp-scan sweeps (~3s each); drives online/offline
 FULL_SCAN_INTERVAL = 600  # seconds between nmap port/hostname scans + mDNS/SSDP discovery
 OFFLINE_AFTER = 90        # seconds unseen (then a failed ping) before a device is marked offline
+PRUNE_AFTER = 7 * 86400   # offline rows unseen this long are deleted, unless named via Rename
 DB_PATH = os.path.expanduser("~/lan-dashboard-data/devices.json")
 
 WIFI_IFACE = "wlan0"
@@ -599,6 +600,18 @@ def apply_full_scan(devices):
         save_db()
 
 
+def prune_stale_rows():
+    now_epoch = time.time()
+    with _lock:
+        stale = [ip for ip, rec in _devices_db.items()
+                 if not rec.get("online") and rec.get("mac") not in _aliases
+                 and now_epoch - _seen_epoch(rec) > PRUNE_AFTER]
+        for ip in stale:
+            del _devices_db[ip]
+        if stale:
+            save_db()
+
+
 def apply_presence(devices):
     now, now_epoch = _now()
     self_ip = get_self_identity()["ip"]
@@ -1039,6 +1052,9 @@ def scan_loop():
         if scanned is not None:
             apply_full_scan(scanned)
             apply_discovery(mdns_discover(), ssdp_discover())
+            # Only after a successful scan: if our own network is down,
+            # "unseen for 7 days" says nothing about the devices.
+            prune_stale_rows()
         _scan_in_progress.clear()
         _scan_trigger.wait(timeout=FULL_SCAN_INTERVAL)
         _scan_trigger.clear()
